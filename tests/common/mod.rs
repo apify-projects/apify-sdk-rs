@@ -1,0 +1,560 @@
+//! A fake Apify API: the storage endpoints the SDK uses, kept in memory. It can make the request
+//! queue head lag behind writes, as it does on the platform, and answer with rate limits.
+
+#![allow(dead_code)]
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use crawlee::core::request::unique_key_to_request_id;
+use parking_lot::Mutex;
+use serde_json::{Value, json};
+
+pub const DEFAULT_DATASET: &str = "default-dataset";
+pub const DEFAULT_STORE: &str = "default-store";
+pub const DEFAULT_QUEUE: &str = "default-queue";
+pub const TOKEN: &str = "test-token";
+
+#[derive(Default)]
+struct Dataset {
+    name: Option<String>,
+    items: Vec<Value>,
+}
+
+#[derive(Default)]
+struct Store {
+    name: Option<String>,
+    records: BTreeMap<String, (Vec<u8>, String)>,
+}
+
+struct QueuedRequest {
+    body: Value,
+    order: i64,
+    /// The head listing number from which the request shows in the head.
+    visible_from: u64,
+}
+
+#[derive(Default)]
+struct Queue {
+    name: Option<String>,
+    requests: HashMap<String, QueuedRequest>,
+    next_order: i64,
+    head_listings: u64,
+}
+
+impl Queue {
+    fn order(&mut self, forefront: bool) -> i64 {
+        self.next_order += 1;
+        if forefront { -self.next_order } else { self.next_order }
+    }
+
+    fn info(&self, id: &str) -> Value {
+        let handled = self.requests.values().filter(|r| !r.body["handledAt"].is_null()).count();
+        json!({
+            "id": id, "name": self.name, "userId": "user", "createdAt": NOW, "modifiedAt": NOW, "accessedAt": NOW,
+            "totalRequestCount": self.requests.len(), "handledRequestCount": handled,
+            "pendingRequestCount": self.requests.len() - handled,
+        })
+    }
+}
+
+#[derive(Default)]
+struct Data {
+    datasets: HashMap<String, Dataset>,
+    stores: HashMap<String, Store>,
+    queues: HashMap<String, Queue>,
+    next_id: u64,
+    calls: Vec<String>,
+}
+
+impl Data {
+    fn new_id(&mut self) -> String {
+        self.next_id += 1;
+        format!("storage-{}", self.next_id)
+    }
+}
+
+const NOW: &str = "2026-01-01T00:00:00.000Z";
+
+#[derive(Clone, Default)]
+struct Shared {
+    data: Arc<Mutex<Data>>,
+    /// How many requests to answer with `429 Too Many Requests`.
+    rate_limited: Arc<AtomicU32>,
+    /// How many head listings a newly added request stays out of the head.
+    head_lag: Arc<AtomicU32>,
+}
+
+/// A running fake API. Cheap to clone.
+#[derive(Clone)]
+pub struct FakeApi {
+    pub url: String,
+    shared: Shared,
+}
+
+impl FakeApi {
+    /// A fake API with the default storages of a run.
+    pub async fn start() -> FakeApi {
+        let shared = Shared::default();
+        {
+            let mut data = shared.data.lock();
+            data.datasets.insert(DEFAULT_DATASET.to_owned(), Dataset::default());
+            data.stores.insert(DEFAULT_STORE.to_owned(), Store::default());
+            data.queues.insert(DEFAULT_QUEUE.to_owned(), Queue::default());
+        }
+        let app = Router::new()
+            .route("/v2/datasets", post(create_dataset))
+            .route("/v2/datasets/{id}", get(get_dataset).delete(delete_dataset))
+            .route("/v2/datasets/{id}/items", get(list_items).post(push_items))
+            .route("/v2/key-value-stores", post(create_store))
+            .route("/v2/key-value-stores/{id}", get(get_store).delete(delete_store))
+            .route("/v2/key-value-stores/{id}/keys", get(list_keys))
+            .route("/v2/key-value-stores/{id}/records/{key}", get(get_record).put(put_record).delete(delete_record))
+            .route("/v2/request-queues", post(create_queue))
+            .route("/v2/request-queues/{id}", get(get_queue).delete(delete_queue))
+            .route("/v2/request-queues/{id}/head", get(list_head))
+            .route("/v2/request-queues/{id}/requests", get(list_requests))
+            .route("/v2/request-queues/{id}/requests/batch", post(batch_add))
+            .route("/v2/request-queues/{id}/requests/{request_id}", get(get_request).put(update_request))
+            .layer(tower_http::decompression::RequestDecompressionLayer::new())
+            .layer(middleware::from_fn_with_state(shared.clone(), gate))
+            .with_state(shared.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        FakeApi { url, shared }
+    }
+
+    /// The next `count` requests are answered with `429 Too Many Requests`.
+    pub fn rate_limit_next(&self, count: u32) {
+        self.shared.rate_limited.store(count, Ordering::SeqCst);
+    }
+
+    /// Requests added from now on show in the queue head only after `listings` head listings.
+    pub fn set_head_lag(&self, listings: u32) {
+        self.shared.head_lag.store(listings, Ordering::SeqCst);
+    }
+
+    /// The API calls made so far, as `"METHOD /path"`.
+    pub fn calls(&self) -> Vec<String> {
+        self.shared.data.lock().calls.clone()
+    }
+
+    pub fn count_calls(&self, prefix: &str) -> usize {
+        self.calls().iter().filter(|call| call.starts_with(prefix)).count()
+    }
+
+    pub fn clear_calls(&self) {
+        self.shared.data.lock().calls.clear();
+    }
+
+    pub fn dataset_items(&self, id: &str) -> Vec<Value> {
+        self.shared.data.lock().datasets.get(id).map(|d| d.items.clone()).unwrap_or_default()
+    }
+
+    pub fn record(&self, store: &str, key: &str) -> Option<(Vec<u8>, String)> {
+        self.shared.data.lock().stores.get(store)?.records.get(key).cloned()
+    }
+
+    pub fn put_record(&self, store: &str, key: &str, value: &[u8], content_type: &str) {
+        let mut data = self.shared.data.lock();
+        data.stores
+            .entry(store.to_owned())
+            .or_default()
+            .records
+            .insert(key.to_owned(), (value.to_vec(), content_type.to_owned()));
+    }
+
+    pub fn storage_count(&self) -> (usize, usize, usize) {
+        let data = self.shared.data.lock();
+        (data.datasets.len(), data.stores.len(), data.queues.len())
+    }
+
+    pub fn delete_dataset(&self, id: &str) {
+        self.shared.data.lock().datasets.remove(id);
+    }
+
+    /// Adds a request as another client would.
+    pub fn add_request(&self, queue: &str, url: &str) {
+        let mut data = self.shared.data.lock();
+        let lag = self.shared.head_lag.load(Ordering::SeqCst);
+        let queue = data.queues.get_mut(queue).unwrap();
+        let id = unique_key_to_request_id(url);
+        let order = queue.order(false);
+        let visible_from = queue.head_listings + u64::from(lag);
+        let body = json!({ "id": id, "url": url, "uniqueKey": url, "method": "GET", "retryCount": 0 });
+        queue.requests.insert(id, QueuedRequest { body, order, visible_from });
+    }
+
+    pub fn queue_request(&self, queue: &str, id: &str) -> Option<Value> {
+        Some(self.shared.data.lock().queues.get(queue)?.requests.get(id)?.body.clone())
+    }
+}
+
+async fn gate(State(shared): State<Shared>, request: Request, next: Next) -> Response {
+    let call = format!("{} {}", request.method(), request.uri().path());
+    shared.data.lock().calls.push(call);
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .is_some_and(|value| value.to_str().is_ok_and(|v| v == format!("Bearer {TOKEN}")));
+    if !authorized {
+        return error(StatusCode::UNAUTHORIZED, "token-not-provided");
+    }
+    let limited = shared.rate_limited.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+    if limited {
+        return error(StatusCode::TOO_MANY_REQUESTS, "rate-limit-exceeded");
+    }
+    next.run(request).await
+}
+
+fn error(status: StatusCode, error_type: &str) -> Response {
+    (status, axum::Json(json!({ "error": { "type": error_type, "message": error_type } }))).into_response()
+}
+
+fn not_found() -> Response {
+    error(StatusCode::NOT_FOUND, "record-not-found")
+}
+
+fn envelope(status: StatusCode, value: Value) -> Response {
+    (status, axum::Json(json!({ "data": value }))).into_response()
+}
+
+fn flag(query: &HashMap<String, String>, name: &str) -> bool {
+    query.get(name).is_some_and(|value| value == "1" || value == "true")
+}
+
+fn number(query: &HashMap<String, String>, name: &str) -> Option<usize> {
+    query.get(name).and_then(|value| value.parse().ok())
+}
+
+// ─── Datasets ───────────────────────────────────────────────────────────────
+
+fn dataset_info(id: &str, dataset: &Dataset) -> Value {
+    json!({
+        "id": id, "name": dataset.name, "userId": "user", "createdAt": NOW, "modifiedAt": NOW, "accessedAt": NOW,
+        "itemCount": dataset.items.len(), "cleanItemCount": dataset.items.len(),
+    })
+}
+
+async fn create_dataset(State(shared): State<Shared>, Query(query): Query<HashMap<String, String>>) -> Response {
+    let mut data = shared.data.lock();
+    let name = query.get("name").cloned();
+    if let Some(name) = &name
+        && let Some((id, dataset)) = data.datasets.iter().find(|(_, d)| d.name.as_ref() == Some(name))
+    {
+        return data_created(dataset_info(id, dataset));
+    }
+    let id = data.new_id();
+    let dataset = Dataset { name, ..Dataset::default() };
+    let info = dataset_info(&id, &dataset);
+    data.datasets.insert(id, dataset);
+    data_created(info)
+}
+
+fn data_created(value: Value) -> Response {
+    envelope(StatusCode::CREATED, value)
+}
+
+fn find_dataset<'a>(data: &'a mut Data, id: &str) -> Option<(String, &'a mut Dataset)> {
+    let id = if data.datasets.contains_key(id) {
+        id.to_owned()
+    } else {
+        data.datasets.iter().find(|(_, d)| d.name.as_deref() == Some(id))?.0.clone()
+    };
+    let dataset = data.datasets.get_mut(&id)?;
+    Some((id, dataset))
+}
+
+async fn get_dataset(State(shared): State<Shared>, Path(id): Path<String>) -> Response {
+    let mut data = shared.data.lock();
+    match find_dataset(&mut data, &id) {
+        Some((id, dataset)) => envelope(StatusCode::OK, dataset_info(&id, dataset)),
+        None => not_found(),
+    }
+}
+
+async fn delete_dataset(State(shared): State<Shared>, Path(id): Path<String>) -> Response {
+    shared.data.lock().datasets.remove(&id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn push_items(State(shared): State<Shared>, Path(id): Path<String>, body: Bytes) -> Response {
+    let mut data = shared.data.lock();
+    let Some((_, dataset)) = find_dataset(&mut data, &id) else { return not_found() };
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Array(items)) => dataset.items.extend(items),
+        Ok(item @ Value::Object(_)) => dataset.items.push(item),
+        _ => return error(StatusCode::BAD_REQUEST, "invalid-input"),
+    }
+    StatusCode::CREATED.into_response()
+}
+
+async fn list_items(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mut data = shared.data.lock();
+    let Some((_, dataset)) = find_dataset(&mut data, &id) else { return not_found() };
+    let mut items = dataset.items.clone();
+    if flag(&query, "desc") {
+        items.reverse();
+    }
+    let total = items.len();
+    let offset = number(&query, "offset").unwrap_or(0);
+    let limit = number(&query, "limit").unwrap_or(usize::MAX);
+    let page: Vec<Value> = items.into_iter().skip(offset).take(limit).collect();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-apify-pagination-total", total.into());
+    headers.insert("x-apify-pagination-offset", offset.into());
+    headers.insert("x-apify-pagination-limit", limit.min(u32::MAX as usize).into());
+    headers.insert("x-apify-pagination-count", page.len().into());
+    (headers, axum::Json(page)).into_response()
+}
+
+// ─── Key-value stores ───────────────────────────────────────────────────────
+
+fn store_info(id: &str, store: &Store) -> Value {
+    json!({ "id": id, "name": store.name, "userId": "user", "createdAt": NOW, "modifiedAt": NOW, "accessedAt": NOW })
+}
+
+async fn create_store(State(shared): State<Shared>, Query(query): Query<HashMap<String, String>>) -> Response {
+    let mut data = shared.data.lock();
+    let name = query.get("name").cloned();
+    if let Some(name) = &name
+        && let Some((id, store)) = data.stores.iter().find(|(_, s)| s.name.as_ref() == Some(name))
+    {
+        return data_created(store_info(id, store));
+    }
+    let id = data.new_id();
+    let store = Store { name, ..Store::default() };
+    let info = store_info(&id, &store);
+    data.stores.insert(id, store);
+    data_created(info)
+}
+
+async fn get_store(State(shared): State<Shared>, Path(id): Path<String>) -> Response {
+    let data = shared.data.lock();
+    match data.stores.get(&id) {
+        Some(store) => envelope(StatusCode::OK, store_info(&id, store)),
+        None => not_found(),
+    }
+}
+
+async fn delete_store(State(shared): State<Shared>, Path(id): Path<String>) -> Response {
+    shared.data.lock().stores.remove(&id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn list_keys(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let data = shared.data.lock();
+    let Some(store) = data.stores.get(&id) else { return not_found() };
+    let limit = number(&query, "limit").unwrap_or(1000);
+    let start = query.get("exclusiveStartKey");
+    let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+    let keys: Vec<(&String, usize)> = store
+        .records
+        .iter()
+        .filter(|(key, _)| start.is_none_or(|start| key.as_str() > start.as_str()) && key.starts_with(prefix))
+        .map(|(key, (value, _))| (key, value.len()))
+        .collect();
+    let page: Vec<Value> = keys.iter().take(limit).map(|(key, size)| json!({ "key": key, "size": size })).collect();
+    let truncated = keys.len() > limit;
+    envelope(
+        StatusCode::OK,
+        json!({
+            "items": page, "count": page.len(), "limit": limit, "exclusiveStartKey": start, "isTruncated": truncated,
+            "nextExclusiveStartKey": if truncated { page.last().map(|item| item["key"].clone()) } else { None },
+        }),
+    )
+}
+
+async fn get_record(State(shared): State<Shared>, Path((id, key)): Path<(String, String)>, method: Method) -> Response {
+    let data = shared.data.lock();
+    let Some((value, content_type)) = data.stores.get(&id).and_then(|store| store.records.get(&key)) else {
+        return if method == Method::HEAD { StatusCode::NOT_FOUND.into_response() } else { not_found() };
+    };
+    ([(header::CONTENT_TYPE, content_type.clone())], value.clone()).into_response()
+}
+
+async fn put_record(
+    State(shared): State<Shared>,
+    Path((id, key)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let mut data = shared.data.lock();
+    let Some(store) = data.stores.get_mut(&id) else { return not_found() };
+    let content_type = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
+    store.records.insert(key, (body.to_vec(), content_type));
+    StatusCode::CREATED.into_response()
+}
+
+async fn delete_record(State(shared): State<Shared>, Path((id, key)): Path<(String, String)>) -> Response {
+    if let Some(store) = shared.data.lock().stores.get_mut(&id) {
+        store.records.remove(&key);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ─── Request queues ─────────────────────────────────────────────────────────
+
+async fn create_queue(State(shared): State<Shared>, Query(query): Query<HashMap<String, String>>) -> Response {
+    let mut data = shared.data.lock();
+    let name = query.get("name").cloned();
+    if let Some(name) = &name
+        && let Some((id, queue)) = data.queues.iter().find(|(_, q)| q.name.as_ref() == Some(name))
+    {
+        return data_created(queue.info(id));
+    }
+    let id = data.new_id();
+    let queue = Queue { name, ..Queue::default() };
+    let info = queue.info(&id);
+    data.queues.insert(id, queue);
+    data_created(info)
+}
+
+async fn get_queue(State(shared): State<Shared>, Path(id): Path<String>) -> Response {
+    let data = shared.data.lock();
+    match data.queues.get(&id) {
+        Some(queue) => envelope(StatusCode::OK, queue.info(&id)),
+        None => not_found(),
+    }
+}
+
+async fn delete_queue(State(shared): State<Shared>, Path(id): Path<String>) -> Response {
+    shared.data.lock().queues.remove(&id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn list_head(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mut data = shared.data.lock();
+    let Some(queue) = data.queues.get_mut(&id) else { return not_found() };
+    queue.head_listings += 1;
+    let listing = queue.head_listings;
+    let limit = number(&query, "limit").unwrap_or(100);
+    let mut pending: Vec<&QueuedRequest> =
+        queue.requests.values().filter(|r| r.body["handledAt"].is_null() && r.visible_from < listing).collect();
+    pending.sort_by_key(|r| r.order);
+    let items: Vec<Value> = pending
+        .into_iter()
+        .take(limit)
+        .map(|r| {
+            let b = &r.body;
+            json!({ "id": b["id"], "uniqueKey": b["uniqueKey"], "url": b["url"], "method": b["method"], "retryCount": b["retryCount"] })
+        })
+        .collect();
+    envelope(
+        StatusCode::OK,
+        json!({ "limit": limit, "queueModifiedAt": NOW, "hadMultipleClients": false, "items": items }),
+    )
+}
+
+async fn list_requests(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let data = shared.data.lock();
+    let Some(queue) = data.queues.get(&id) else { return not_found() };
+    let limit = number(&query, "limit").unwrap_or(1000);
+    let mut requests: Vec<&QueuedRequest> = queue.requests.values().collect();
+    requests.sort_by_key(|r| r.order);
+    let items: Vec<Value> = requests.into_iter().take(limit).map(|r| r.body.clone()).collect();
+    envelope(StatusCode::OK, json!({ "limit": limit, "items": items }))
+}
+
+async fn batch_add(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    let lag = shared.head_lag.load(Ordering::SeqCst);
+    let mut data = shared.data.lock();
+    let Some(queue) = data.queues.get_mut(&id) else { return not_found() };
+    let Ok(Value::Array(requests)) = serde_json::from_slice::<Value>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "invalid-input");
+    };
+    let forefront = flag(&query, "forefront");
+    let mut processed = Vec::new();
+    for mut request in requests {
+        if request.get("id").is_some() {
+            return error(StatusCode::BAD_REQUEST, "invalid-input: id must not be set");
+        }
+        let unique_key = request["uniqueKey"].as_str().unwrap().to_owned();
+        let request_id = unique_key_to_request_id(&unique_key);
+        let (present, handled) = match queue.requests.get(&request_id) {
+            Some(existing) => (true, !existing.body["handledAt"].is_null()),
+            None => {
+                request["id"] = json!(request_id);
+                let order = queue.order(forefront);
+                let visible_from = queue.head_listings + u64::from(lag);
+                queue.requests.insert(request_id.clone(), QueuedRequest { body: request, order, visible_from });
+                (false, false)
+            }
+        };
+        processed.push(json!({
+            "requestId": request_id, "uniqueKey": unique_key, "wasAlreadyPresent": present, "wasAlreadyHandled": handled,
+        }));
+    }
+    data_created(json!({ "processedRequests": processed, "unprocessedRequests": [] }))
+}
+
+async fn get_request(State(shared): State<Shared>, Path((id, request_id)): Path<(String, String)>) -> Response {
+    let data = shared.data.lock();
+    match data.queues.get(&id).and_then(|queue| queue.requests.get(&request_id)) {
+        Some(request) => envelope(StatusCode::OK, request.body.clone()),
+        None => not_found(),
+    }
+}
+
+async fn update_request(
+    State(shared): State<Shared>,
+    Path((id, request_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    let mut data = shared.data.lock();
+    let Some(queue) = data.queues.get_mut(&id) else { return not_found() };
+    let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "invalid-input");
+    };
+    let forefront = flag(&query, "forefront");
+    let order = queue.order(forefront);
+    let listing = queue.head_listings;
+    let (present, handled) = match queue.requests.get_mut(&request_id) {
+        Some(existing) => {
+            let handled = !existing.body["handledAt"].is_null();
+            existing.body = request;
+            existing.order = order;
+            existing.visible_from = listing;
+            (true, handled)
+        }
+        None => {
+            queue.requests.insert(request_id.clone(), QueuedRequest { body: request, order, visible_from: listing });
+            (false, false)
+        }
+    };
+    envelope(
+        StatusCode::OK,
+        json!({ "requestId": request_id, "wasAlreadyPresent": present, "wasAlreadyHandled": handled }),
+    )
+}

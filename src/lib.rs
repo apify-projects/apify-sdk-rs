@@ -5,8 +5,10 @@
 
 pub mod client;
 pub mod configuration;
+pub mod storage;
 
 pub use crate::client::{RateLimitCounter, new_client};
 pub use crate::configuration::Configuration;
+pub use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 
 pub use apify_client::ApifyClient;
