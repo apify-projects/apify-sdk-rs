@@ -1,0 +1,597 @@
+//! [`Actor`]: the lifecycle of an Actor run, and access to its storages, input and platform.
+
+use std::future::Future;
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use apify_client::ApifyClient;
+use crawlee::core::storage::backend::StorageBackend;
+use crawlee::core::{Event, EventKind, EventManager, StatusLevel};
+use crawlee::{Dataset, KeyValueStore, RequestQueue, Services, StorageIdentifier};
+use parking_lot::Mutex;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+
+use crate::client::{RateLimitCounter, new_client};
+use crate::configuration::Configuration;
+use crate::input::{ActorInputError, ActorInputErrorCode, Input, InputSchema};
+use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
+
+/// Exit codes of an Actor run (`EXIT_CODES` in `@apify/consts`).
+pub mod exit_codes {
+    pub const SUCCESS: i32 = 0;
+    pub const ERROR_USER_FUNCTION_THREW: i32 = 91;
+    pub const ERROR_UNKNOWN: i32 = 92;
+}
+
+/// How long `set_status_message` waits for the API.
+const STATUS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Options of [`Actor::init`].
+#[derive(Clone)]
+pub struct InitOptions {
+    /// The configuration; [`Configuration::from_env`] when not set.
+    pub configuration: Option<Configuration>,
+    /// A storage backend used instead of the platform storages (on the platform) or the local
+    /// files (elsewhere).
+    pub storage: Option<Arc<dyn StorageBackend>>,
+    /// How request queues on the platform are consumed.
+    pub request_queue_access: RequestQueueAccess,
+    /// Exit when the run is aborted, and reboot when it is migrated. Default `true`.
+    pub graceful_shutdown: bool,
+    /// How long to wait before the graceful exit or reboot.
+    pub graceful_shutdown_delay: Duration,
+}
+
+impl Default for InitOptions {
+    fn default() -> Self {
+        InitOptions {
+            configuration: None,
+            storage: None,
+            request_queue_access: RequestQueueAccess::default(),
+            graceful_shutdown: true,
+            graceful_shutdown_delay: Duration::ZERO,
+        }
+    }
+}
+
+/// Options of [`Actor::exit`].
+#[derive(Clone, Debug)]
+pub struct ExitOptions {
+    /// The last status message of the run.
+    pub status_message: Option<String>,
+    pub exit_code: i32,
+    /// End the process. With `false`, `exit` only tears the Actor down and returns.
+    pub exit: bool,
+    /// How long to wait for event listeners and storages before exiting anyway. Default 30 s.
+    pub timeout: Duration,
+}
+
+impl Default for ExitOptions {
+    fn default() -> Self {
+        ExitOptions {
+            status_message: None,
+            exit_code: exit_codes::SUCCESS,
+            exit: true,
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ExitOptions {
+    pub fn message(message: impl Into<String>) -> Self {
+        ExitOptions { status_message: Some(message.into()), ..ExitOptions::default() }
+    }
+}
+
+/// Options of [`Actor::set_status_message`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StatusMessageOptions {
+    /// The last message of the run.
+    pub is_terminal: bool,
+    /// How the message is logged. `Debug` (the default) logs it at the info level, as in JS.
+    pub level: StatusLevel,
+}
+
+/// Where storages are opened (see [`Actor::open_dataset`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpenOptions {
+    /// Use the platform storage even when running locally (needs `APIFY_TOKEN`).
+    pub force_cloud: bool,
+}
+
+#[derive(Default)]
+struct Handlers {
+    graceful: Vec<crawlee::core::events::ListenerId>,
+    status_forwarder: Option<crawlee::core::events::ListenerId>,
+}
+
+struct Inner {
+    configuration: Arc<Configuration>,
+    client: ApifyClient,
+    storage: Arc<dyn StorageBackend>,
+    smart: Option<Arc<SmartStorageBackend>>,
+    services: Services,
+    exiting: AtomicBool,
+    rebooting: AtomicBool,
+    handlers: Mutex<Handlers>,
+    websocket: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// An Actor run: a cheap handle to its configuration, storages, events and API client.
+///
+/// [`Actor::init`] creates it and installs its [`Services`] as the process-wide crawlee-rs
+/// services, so crawlers built afterwards store their data where the Actor does: in the
+/// platform storages on the platform, in `./storage` elsewhere. [`Actor::current`] returns it
+/// from anywhere, like the static `Actor` of the JS SDK.
+#[derive(Clone)]
+pub struct Actor {
+    inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for Actor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Actor").field("is_at_home", &self.inner.configuration.is_at_home).finish_non_exhaustive()
+    }
+}
+
+static CURRENT: OnceLock<Actor> = OnceLock::new();
+
+/// Initialization failed.
+#[derive(Debug, thiserror::Error)]
+pub enum InitError {
+    #[error(
+        "Actor::init() was called after the crawlee-rs services were used or set: a storage was opened or a crawler \
+         was built before it. Call Actor::init() first, and pass a storage of your own as InitOptions::storage."
+    )]
+    ServicesAlreadySet,
+    #[error(transparent)]
+    Storage(#[from] crawlee::core::StorageError),
+}
+
+/// Runs `user_function` as an Actor: [`Actor::init`], the function, then [`Actor::exit`]. When
+/// the function fails, the error is logged and the run exits with code 91.
+///
+/// ```no_run
+/// # async fn run() {
+/// apify::main(|actor| async move {
+///     let input: serde_json::Value = actor.get_input().await?;
+///     actor.push_data(&input).await?;
+///     Ok(())
+/// })
+/// .await;
+/// # }
+/// ```
+pub async fn main<F, Fut>(user_function: F)
+where
+    F: FnOnce(Actor) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    main_with(InitOptions::default(), ExitOptions::default(), user_function).await;
+}
+
+/// [`main`] with options.
+pub async fn main_with<F, Fut>(init: InitOptions, exit: ExitOptions, user_function: F)
+where
+    F: FnOnce(Actor) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let actor = match Actor::init(init).await {
+        Ok(actor) => actor,
+        Err(err) => {
+            tracing::error!("Initializing the Actor failed: {err}");
+            flush_and_exit(exit_codes::ERROR_UNKNOWN);
+        }
+    };
+    match user_function(actor.clone()).await {
+        Ok(()) => actor.exit(exit).await,
+        Err(err) => {
+            tracing::error!("{err:?}");
+            // The JS SDK drops the other exit options here.
+            actor.exit(ExitOptions { exit_code: exit_codes::ERROR_USER_FUNCTION_THREW, ..exit }).await;
+        }
+    }
+}
+
+fn flush_and_exit(code: i32) -> ! {
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code)
+}
+
+impl Actor {
+    /// The Actor initialized in this process, if any.
+    pub fn current() -> Option<Actor> {
+        CURRENT.get().cloned()
+    }
+
+    /// Initializes the Actor: installs the storages and events of the run as the process-wide
+    /// crawlee-rs services, connects to the platform events, and purges the local default
+    /// storages. A second call returns the Actor of the first.
+    pub async fn init(options: InitOptions) -> Result<Actor, InitError> {
+        if let Some(actor) = Actor::current() {
+            tracing::debug!("The Actor was already initialized");
+            return Ok(actor);
+        }
+        if Services::is_global_set() {
+            return Err(InitError::ServicesAlreadySet);
+        }
+
+        let configuration = Arc::new(options.configuration.unwrap_or_else(Configuration::from_env));
+        tracing::info!(
+            apify_version = env!("CARGO_PKG_VERSION"),
+            apify_client_version = apify_client::CLIENT_VERSION,
+            crawlee_version = crawlee::VERSION,
+            os = std::env::consts::OS,
+            "System info"
+        );
+
+        let client = new_client(&configuration, None, RateLimitCounter::default());
+        let (storage, smart): (Arc<dyn StorageBackend>, _) = match options.storage {
+            Some(storage) => (storage, None),
+            None => {
+                let cloud = Arc::new(
+                    ApifyStorageBackend::new(configuration.clone()).request_queue_access(options.request_queue_access),
+                );
+                let local = SmartStorageBackend::local_backend(&configuration);
+                let smart = Arc::new(SmartStorageBackend::new(configuration.clone(), cloud, local));
+                (smart.clone(), Some(smart))
+            }
+        };
+
+        // On the platform, system info comes from the platform events; locally it is measured.
+        let events = if configuration.is_at_home {
+            EventManager::new(configuration.crawlee.persist_state_interval)
+        } else {
+            EventManager::local(&configuration.crawlee)
+        };
+        let services = Services::from_parts(configuration.crawlee.clone(), storage.clone(), events.clone());
+        Services::set_global(services.clone()).map_err(|_| InitError::ServicesAlreadySet)?;
+
+        let actor = Actor {
+            inner: Arc::new(Inner {
+                configuration: configuration.clone(),
+                client,
+                storage,
+                smart,
+                services,
+                exiting: AtomicBool::new(false),
+                rebooting: AtomicBool::new(false),
+                handlers: Mutex::default(),
+                websocket: Mutex::default(),
+            }),
+        };
+
+        events.init().await;
+        if options.graceful_shutdown {
+            actor.register_graceful_shutdown(options.graceful_shutdown_delay);
+        }
+        // Crawlers report their status as `StatusMessage` events.
+        let forwarder = {
+            let actor = actor.clone();
+            events.on(EventKind::StatusMessage, move |event| {
+                let actor = actor.clone();
+                async move {
+                    if let Event::StatusMessage(status) = event {
+                        actor.update_run_status_message(&status.message, status.is_terminal).await;
+                    }
+                }
+            })
+        };
+        actor.inner.handlers.lock().status_forwarder = Some(forwarder);
+
+        // Connected once the listeners are in place, so that no early event is missed.
+        if configuration.is_at_home {
+            match &configuration.actor_events_ws_url {
+                Some(url) => {
+                    let memory = configuration.crawlee.memory_mbytes.map(|mb| mb * 1024 * 1024);
+                    *actor.inner.websocket.lock() = Some(crate::events::connect(url, events.clone(), memory).await);
+                }
+                None => tracing::debug!(
+                    "Environment variable ACTOR_EVENTS_WEBSOCKET_URL is not set, no events from Apify platform will be emitted."
+                ),
+            }
+        }
+
+        actor.inner.services.purge_on_start().await?;
+        // Only the first `init` of the process gets here.
+        let _ = CURRENT.set(actor.clone());
+        Ok(actor)
+    }
+
+    /// On `aborting`, exit; on `migrating`, reboot to move sooner. Both run outside the listener,
+    /// which `exit` and `reboot` wait for.
+    fn register_graceful_shutdown(&self, delay: Duration) {
+        let events = self.events().clone();
+        let aborting = {
+            let actor = self.clone();
+            events.on(EventKind::Aborting, move |_| {
+                let actor = actor.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    actor.exit(ExitOptions::default()).await;
+                });
+                async {}
+            })
+        };
+        let migrating = {
+            let actor = self.clone();
+            events.on(EventKind::Migrating, move |_| {
+                let actor = actor.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Err(err) = actor.reboot().await {
+                        tracing::error!("Failed to reboot on migration: {err}");
+                    }
+                });
+                async {}
+            })
+        };
+        self.inner.handlers.lock().graceful = vec![aborting, migrating];
+    }
+
+    pub fn configuration(&self) -> &Arc<Configuration> {
+        &self.inner.configuration
+    }
+
+    /// The API client of the run, authenticated with `APIFY_TOKEN`.
+    pub fn client(&self) -> &ApifyClient {
+        &self.inner.client
+    }
+
+    /// A client authenticated with another token.
+    pub fn new_client(&self, token: &str) -> ApifyClient {
+        new_client(&self.inner.configuration, Some(token), RateLimitCounter::default())
+    }
+
+    /// The services of the run, which crawlers use by default.
+    pub fn services(&self) -> &Services {
+        &self.inner.services
+    }
+
+    pub fn events(&self) -> &EventManager {
+        &self.inner.services.events
+    }
+
+    pub fn is_at_home(&self) -> bool {
+        self.inner.configuration.is_at_home
+    }
+
+    /// Ends the run: stops the events (after a final `PersistState`), waits for their listeners,
+    /// tears the storages down, sets the terminal status message and exits the process with
+    /// [`ExitOptions::exit_code`]. If this takes longer than [`ExitOptions::timeout`], the process
+    /// exits anyway. Returns only with [`ExitOptions::exit`] set to `false`, or when already exiting.
+    pub async fn exit(&self, options: ExitOptions) {
+        if self.inner.exiting.swap(true, Ordering::AcqRel) {
+            tracing::debug!("Actor::exit() called while already exiting, skipping");
+            return;
+        }
+        let events = self.events().clone();
+        for id in std::mem::take(&mut self.inner.handlers.lock().graceful) {
+            events.off(id);
+        }
+
+        events.close().await;
+        tracing::debug!("Events closed");
+        events.emit(Event::Exit);
+
+        if options.exit {
+            // A thread of its own: the tokio runtime may be too busy to run a timer.
+            let (timeout, code) = (options.timeout, options.exit_code);
+            std::thread::spawn(move || {
+                std::thread::sleep(timeout);
+                tracing::error!("Exiting the Actor timed out after {} seconds", timeout.as_secs());
+                flush_and_exit(code);
+            });
+        }
+
+        let teardown = async {
+            events.wait_for_all_listeners_to_complete().await;
+            // Final status messages are forwarded by now; later ones must not overwrite the terminal one.
+            if let Some(id) = self.inner.handlers.lock().status_forwarder.take() {
+                events.off(id);
+            }
+            if let Err(err) = self.inner.storage.teardown().await {
+                tracing::error!("Tearing down the storage failed: {err}");
+            }
+            if let Some(message) = &options.status_message {
+                let level = if options.exit_code > 0 { StatusLevel::Error } else { StatusLevel::Info };
+                self.set_status_message(message, StatusMessageOptions { is_terminal: true, level }).await;
+            }
+        };
+        if tokio::time::timeout(options.timeout, teardown).await.is_err() {
+            tracing::error!(
+                "Waiting for all event listeners to complete their execution timed out after {} seconds",
+                options.timeout.as_secs()
+            );
+        }
+        if let Some(websocket) = self.inner.websocket.lock().take() {
+            websocket.abort();
+        }
+
+        self.inner.exiting.store(false, Ordering::Release);
+        if options.exit {
+            flush_and_exit(options.exit_code);
+        }
+    }
+
+    /// [`exit`](Self::exit) with exit code 1.
+    pub async fn fail(&self, options: ExitOptions) {
+        self.exit(ExitOptions { exit_code: 1, ..options }).await;
+    }
+
+    /// Sets the status message of the run, and logs it.
+    pub async fn set_status_message(&self, message: &str, options: StatusMessageOptions) {
+        match options.level {
+            StatusLevel::Warning => tracing::warn!("[Status message]: {message}"),
+            StatusLevel::Error => tracing::error!("[Status message]: {message}"),
+            _ => tracing::info!("[Status message]: {message}"),
+        }
+        self.update_run_status_message(message, options.is_terminal).await;
+    }
+
+    /// Best effort: a failure or a slow API is only logged.
+    async fn update_run_status_message(&self, message: &str, is_terminal: bool) {
+        let Some(run_id) = &self.inner.configuration.actor_run_id else { return };
+        let body = serde_json::json!({ "statusMessage": message, "isStatusMessageTerminal": is_terminal });
+        let run = self.inner.client.run(run_id.clone());
+        match tokio::time::timeout(STATUS_MESSAGE_TIMEOUT, run.update(&body)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!("Setting the status message failed: {err}"),
+            Err(_) => tracing::warn!("Setting status message timed out after 1s"),
+        }
+    }
+
+    /// Reboots the run on the platform (a new container, same run), after its state was saved.
+    /// Does nothing off the platform.
+    pub async fn reboot(&self) -> Result<(), apify_client::ApifyClientError> {
+        let configuration = &self.inner.configuration;
+        if !configuration.is_at_home {
+            tracing::warn!("Actor::reboot() is only supported when running on the Apify platform.");
+            return Ok(());
+        }
+        if self.inner.rebooting.swap(true, Ordering::AcqRel) {
+            tracing::debug!("Actor is already rebooting, skipping the additional reboot call.");
+            return Ok(());
+        }
+        // The container is killed: save the state and pause the crawlers first.
+        let events = self.events();
+        events.emit(Event::PersistState { is_migrating: false });
+        events.emit(Event::Migrating);
+        events.wait_for_all_listeners_to_complete().await;
+
+        let run_id = configuration
+            .actor_run_id
+            .clone()
+            .ok_or_else(|| apify_client::ApifyClientError::InvalidArgument("ACTOR_RUN_ID is not set".to_owned()))?;
+        self.inner.client.run(run_id).reboot().await?;
+        tokio::time::sleep(configuration.metamorph_after_sleep).await;
+        Ok(())
+    }
+
+    fn storage_for(&self, options: OpenOptions) -> crawlee::core::StorageResult<&dyn StorageBackend> {
+        match &self.inner.smart {
+            Some(smart) => smart.suitable(options.force_cloud),
+            None => Ok(self.inner.storage.as_ref()),
+        }
+    }
+
+    pub async fn open_dataset(
+        &self,
+        id: &StorageIdentifier,
+        options: OpenOptions,
+    ) -> crawlee::core::StorageResult<Dataset> {
+        Dataset::open(self.storage_for(options)?, id).await
+    }
+
+    pub async fn open_key_value_store(
+        &self,
+        id: &StorageIdentifier,
+        options: OpenOptions,
+    ) -> crawlee::core::StorageResult<KeyValueStore> {
+        KeyValueStore::open(self.storage_for(options)?, id).await
+    }
+
+    pub async fn open_request_queue(
+        &self,
+        id: &StorageIdentifier,
+        options: OpenOptions,
+    ) -> crawlee::core::StorageResult<RequestQueue> {
+        RequestQueue::open(self.storage_for(options)?, id).await
+    }
+
+    /// Pushes one item (an object) or several (an array) to the default dataset.
+    pub async fn push_data<T: serde::Serialize + ?Sized>(&self, data: &T) -> crawlee::core::StorageResult<()> {
+        self.inner.services.open_dataset(&StorageIdentifier::Default).await?.push_data(data).await
+    }
+
+    /// A value of the default key-value store.
+    pub async fn get_value<T: DeserializeOwned>(&self, key: &str) -> crawlee::core::StorageResult<Option<T>> {
+        self.inner.services.open_key_value_store(&StorageIdentifier::Default).await?.get_value(key).await
+    }
+
+    /// Stores a value as JSON in the default key-value store.
+    pub async fn set_value<T: serde::Serialize + ?Sized>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> crawlee::core::StorageResult<()> {
+        self.inner.services.open_key_value_store(&StorageIdentifier::Default).await?.set_value(key, value).await
+    }
+
+    /// The input of the run, as it was stored. Locally, an `INPUT` or `INPUT.json` file in the
+    /// working directory is used when the default key-value store has no input.
+    pub async fn get_input_raw(&self) -> Result<Input, ActorInputError> {
+        let configuration = &self.inner.configuration;
+        let key = &configuration.input_key;
+        let source = format!("the \"{key}\" record of the default key-value store");
+        let store = self
+            .inner
+            .services
+            .open_key_value_store(&StorageIdentifier::Default)
+            .await
+            .map_err(|err| ActorInputError::new(ActorInputErrorCode::NotFound, err.to_string()).caused_by(err))?;
+        let record = store
+            .get_record(key)
+            .await
+            .map_err(|err| ActorInputError::new(ActorInputErrorCode::NotFound, err.to_string()).caused_by(err))?;
+        let input = match record {
+            Some(record) => Some(crate::input::parse_input(record.value, record.content_type.as_deref(), &source)?),
+            None if !configuration.is_at_home => crate::input::read_input_file(&working_directory(), key).await?,
+            None => None,
+        };
+        let Some(input) = input else {
+            let mut locations = vec![source];
+            if !configuration.is_at_home {
+                locations.push(format!("a \"{key}\" or \"{key}.json\" file in the working directory"));
+            }
+            return Err(ActorInputError::new(
+                ActorInputErrorCode::NotFound,
+                format!("Input does not exist. Expected {}.", locations.join(" or ")),
+            ));
+        };
+        Ok(self.with_schema_defaults(input))
+    }
+
+    /// The input of the run as `T`, from JSON (see [`get_input_raw`](Self::get_input_raw)).
+    /// Locally, missing top-level fields get their defaults from the Actor's input schema.
+    pub async fn get_input<T: DeserializeOwned>(&self) -> Result<T, ActorInputError> {
+        let input = self.get_input_raw().await?;
+        let json = input
+            .into_json()
+            .ok_or_else(|| ActorInputError::new(ActorInputErrorCode::ParseFailed, "The input is binary, not JSON."))?;
+        serde_json::from_value(json).map_err(|err| {
+            ActorInputError::new(
+                ActorInputErrorCode::ParseFailed,
+                format!("The input does not match the expected type: {err}"),
+            )
+            .caused_by(err)
+        })
+    }
+
+    /// The platform applies the defaults itself.
+    fn with_schema_defaults(&self, input: Input) -> Input {
+        let Input::Json(Value::Object(object)) = input else { return input };
+        if self.inner.configuration.is_at_home || object.is_empty() {
+            return Input::Json(Value::Object(object));
+        }
+        match crate::input::read_input_schema(&working_directory()) {
+            InputSchema::Found(schema) => Input::Json(Value::Object(crate::input::apply_defaults(object, &schema))),
+            InputSchema::NotDefined => Input::Json(Value::Object(object)),
+            InputSchema::Missing => {
+                tracing::warn!(
+                    "Failed to find the input schema for the local run of this Actor. Your input will be missing \
+                     fields that have default values set if they are missing from the input you are using."
+                );
+                Input::Json(Value::Object(object))
+            }
+        }
+    }
+}
+
+fn working_directory() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}

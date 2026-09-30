@@ -16,8 +16,10 @@ crawlee = { git = "https://github.com/apify-projects/crawlee-rs", rev = "bfea425
 # `client::ReqwestBackend` on the reqwest version crawlee-rs uses.
 apify-client = { git = "https://github.com/apify/apify-client-rust", rev = "8a4d19753448bbe0c443cfba04824dfcba4be252", default-features = false }
 
+anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 lru = "0.16"
 parking_lot = "0.12"
@@ -27,13 +29,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tower-http = { version = "0.6", features = ["decompression-br", "decompression-gzip"] }
 
 [lints.rust]

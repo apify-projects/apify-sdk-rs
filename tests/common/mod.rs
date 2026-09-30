@@ -73,6 +73,8 @@ struct Data {
     queues: HashMap<String, Queue>,
     next_id: u64,
     calls: Vec<String>,
+    /// Bodies of run updates, in order.
+    run_updates: Vec<Value>,
 }
 
 impl Data {
@@ -124,6 +126,8 @@ impl FakeApi {
             .route("/v2/request-queues/{id}/requests", get(list_requests))
             .route("/v2/request-queues/{id}/requests/batch", post(batch_add))
             .route("/v2/request-queues/{id}/requests/{request_id}", get(get_request).put(update_request))
+            .route("/v2/actor-runs/{id}", axum::routing::put(update_run))
+            .route("/v2/actor-runs/{id}/reboot", post(reboot_run))
             .layer(tower_http::decompression::RequestDecompressionLayer::new())
             .layer(middleware::from_fn_with_state(shared.clone(), gate))
             .with_state(shared.clone());
@@ -192,6 +196,10 @@ impl FakeApi {
         let visible_from = queue.head_listings + u64::from(lag);
         let body = json!({ "id": id, "url": url, "uniqueKey": url, "method": "GET", "retryCount": 0 });
         queue.requests.insert(id, QueuedRequest { body, order, visible_from });
+    }
+
+    pub fn run_updates(&self) -> Vec<Value> {
+        self.shared.data.lock().run_updates.clone()
     }
 
     pub fn queue_request(&self, queue: &str, id: &str) -> Option<Value> {
@@ -557,4 +565,42 @@ async fn update_request(
         StatusCode::OK,
         json!({ "requestId": request_id, "wasAlreadyPresent": present, "wasAlreadyHandled": handled }),
     )
+}
+
+// ─── Runs ───────────────────────────────────────────────────────────────────
+
+async fn update_run(State(shared): State<Shared>, Path(id): Path<String>, body: Bytes) -> Response {
+    let Ok(update) = serde_json::from_slice::<Value>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "invalid-input");
+    };
+    let mut run = json!({ "id": id, "status": "RUNNING" });
+    if let (Value::Object(run), Value::Object(update)) = (&mut run, &update) {
+        run.extend(update.clone());
+    }
+    shared.data.lock().run_updates.push(update);
+    envelope(StatusCode::OK, run)
+}
+
+async fn reboot_run(Path(id): Path<String>) -> Response {
+    envelope(StatusCode::OK, json!({ "id": id, "status": "RUNNING" }))
+}
+
+/// A websocket server that sends `messages` to the first client after `delay`, then keeps the
+/// connection open until the client closes it.
+pub async fn serve_events(delay: std::time::Duration, messages: Vec<Value>) -> String {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        tokio::time::sleep(delay).await;
+        for message in messages {
+            socket.send(Message::text(message.to_string())).await.unwrap();
+        }
+        while let Some(Ok(_)) = socket.next().await {}
+    });
+    url
 }
