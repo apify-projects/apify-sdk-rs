@@ -45,8 +45,14 @@ impl std::fmt::Debug for InputSecretsKey {
     }
 }
 
-/// The DER of a PEM block: its label, its headers and its body.
-fn parse_pem(pem: &str) -> Result<(String, Vec<(String, String)>, Vec<u8>), SecretsError> {
+/// A PEM block: its label, its headers and its body.
+struct Pem {
+    label: String,
+    headers: Vec<(String, String)>,
+    der: Vec<u8>,
+}
+
+fn parse_pem(pem: &str) -> Result<Pem, SecretsError> {
     let mut lines = pem.lines().map(str::trim).filter(|line| !line.is_empty());
     let begin = lines.next().ok_or_else(|| error("the private key is empty"))?;
     let label = begin
@@ -61,7 +67,7 @@ fn parse_pem(pem: &str) -> Result<(String, Vec<(String, String)>, Vec<u8>), Secr
             let der = base64::engine::general_purpose::STANDARD
                 .decode(body)
                 .map_err(|err| error(format!("the private key PEM is not base64: {err}")))?;
-            return Ok((label, headers, der));
+            return Ok(Pem { label, headers, der });
         }
         match line.split_once(':') {
             Some((name, value)) if body.is_empty() => headers.push((name.trim().to_owned(), value.trim().to_owned())),
@@ -163,7 +169,7 @@ impl InputSecretsKey {
             .decode(key_file.trim())
             .map_err(|err| error(format!("the private key is not base64: {err}")))?;
         let pem = String::from_utf8(pem).map_err(|_| error("the private key PEM is not text"))?;
-        let (label, headers, der) = parse_pem(&pem)?;
+        let Pem { label, headers, der } = parse_pem(&pem)?;
         let header = |name: &str| headers.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
         let pkcs8 = match label.as_str() {
             "RSA PRIVATE KEY" => {

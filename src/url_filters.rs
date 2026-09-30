@@ -28,7 +28,7 @@ pub enum GlobInput {
     WithOptions {
         glob: String,
         #[serde(flatten)]
-        options: UrlPatternRequestOptions,
+        options: Box<UrlPatternRequestOptions>,
     },
 }
 
@@ -40,7 +40,7 @@ pub enum PseudoUrlInput {
     WithOptions {
         purl: String,
         #[serde(flatten)]
-        options: UrlPatternRequestOptions,
+        options: Box<UrlPatternRequestOptions>,
     },
 }
 
@@ -82,9 +82,8 @@ pub fn purl_to_regex(purl: &str) -> Result<Regex, UrlFilterError> {
             open_brackets == 0
         } {
             regex.push(')');
-        } else if open_brackets > 0 {
-            regex.push(ch);
-        } else if ch.is_ascii_alphanumeric() {
+        } else if open_brackets > 0 || ch.is_ascii_alphanumeric() {
+            // Inside a `[regex]` section, or a character that needs no escaping.
             regex.push(ch);
         } else {
             regex.push_str(&format!("\\x{{{:02x}}}", ch as u32));
@@ -112,7 +111,7 @@ impl RequestTransform {
         for glob in &filters.globs {
             let (glob, options) = match glob {
                 GlobInput::Glob(glob) => (glob, UrlPatternRequestOptions::default()),
-                GlobInput::WithOptions { glob, options } => (glob, options.clone()),
+                GlobInput::WithOptions { glob, options } => (glob, (**options).clone()),
             };
             if glob.trim().is_empty() {
                 continue;
@@ -122,7 +121,7 @@ impl RequestTransform {
         for purl in &filters.pseudo_urls {
             let (purl, options) = match purl {
                 PseudoUrlInput::Purl(purl) => (purl, UrlPatternRequestOptions::default()),
-                PseudoUrlInput::WithOptions { purl, options } => (purl, options.clone()),
+                PseudoUrlInput::WithOptions { purl, options } => (purl, (**options).clone()),
             };
             if purl.trim().is_empty() {
                 continue;
