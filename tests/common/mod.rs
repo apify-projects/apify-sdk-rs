@@ -138,6 +138,7 @@ impl FakeApi {
             .route("/v2/users/me", get(get_me))
             .route("/v2/actor-runs/{id}", axum::routing::put(update_run).get(get_run))
             .route("/v2/actor-runs/{id}/abort", post(run_action))
+            .route("/v2/actor-runs/{id}/charge", post(run_action))
             .route("/v2/actor-runs/{id}/metamorph", post(run_action))
             .route("/v2/actors/{id}/runs", post(start_run))
             .route("/v2/actor-tasks/{id}/runs", post(start_run))

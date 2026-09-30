@@ -4,6 +4,7 @@
 //! See `docs/plan.md` for the scope and the milestones.
 
 pub mod actor;
+pub mod charging;
 pub mod client;
 pub mod configuration;
 pub mod events;

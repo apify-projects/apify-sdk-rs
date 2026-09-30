@@ -203,6 +203,50 @@ async fn the_platform_api() {
     assert_eq!(serde_json::from_slice::<Value>(&state).unwrap(), json!({ "calls": 5 }));
 }
 
+#[tokio::test]
+async fn pay_per_event_charges_stay_within_the_budget() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "page": { "eventTitle": "Page", "eventPriceUsd": 1.0 },
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "5".to_owned()));
+    assert_exit(&run_child("ppe", &vars, dir.path()).await, 0);
+
+    assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 10, "5 USD buy 10 items at 0.5");
+    let charges: Vec<Value> = api
+        .platform_calls()
+        .into_iter()
+        .filter(|(path, _, _)| path.ends_with("/charge"))
+        .map(|(_, _, body)| body)
+        .collect();
+    // Dataset items are charged by the platform itself; `page` once, over the budget.
+    assert_eq!(charges, [json!({ "eventName": "page", "count": 1 })]);
+}
+
+#[tokio::test]
+async fn local_pay_per_event_runs_log_their_charges() {
+    let dir = tempfile::tempdir().unwrap();
+    let vars = [
+        ("ACTOR_TEST_PAY_PER_EVENT", "1".to_owned()),
+        ("ACTOR_USE_CHARGING_LOG_DATASET", "1".to_owned()),
+        ("ACTOR_MAX_TOTAL_CHARGE_USD", "3".to_owned()),
+    ];
+    assert_exit(&run_child("ppe-local", &vars, dir.path()).await, 0);
+    let items = std::fs::read_dir(dir.path().join("storage/datasets/default")).unwrap().count() - 1;
+    assert_eq!(items, 3, "every event costs 1 locally");
+    let log: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("storage/datasets/charging_log/000000001.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(log["eventName"], "apify-default-dataset-item");
+    assert_eq!(log["chargedCount"], 3);
+}
+
 /// The scenarios, run by [`run_child`]. Does nothing in a normal test run.
 #[test]
 fn child() {
@@ -258,6 +302,30 @@ fn child() {
                     assert!(actor.add_webhook(webhook).await?.is_some());
                     actor.metamorph("apify/other", None::<&Value>, Default::default()).await?;
                     state.lock()["calls"] = json!(5);
+                    Ok(())
+                })
+                .await
+            }
+            "ppe" => {
+                apify::main(|actor| async move {
+                    assert!(actor.charging_manager().is_pay_per_event());
+                    let items: Vec<Value> = (0..20).map(|n| json!({ "n": n })).collect();
+                    let result = actor.push_data(&items).await?;
+                    assert_eq!(result.charged_count, 10);
+                    assert!(result.event_charge_limit_reached);
+                    let result = actor.charge(apify::charging::ChargeOptions::new("page", 1)).await?;
+                    assert_eq!(result.charged_count, 1, "one over the budget, so that the platform stops the run");
+                    let result = actor.push_data_and_charge(&items[..3], "page").await?;
+                    assert_eq!(result.charged_count, 0);
+                    assert!(actor.push_data_and_charge(&items[0], "apify-default-dataset-item").await.is_err());
+                    Ok(())
+                })
+                .await
+            }
+            "ppe-local" => {
+                apify::main(|actor| async move {
+                    let items: Vec<Value> = (0..5).map(|n| json!({ "n": n })).collect();
+                    assert_eq!(actor.push_data(&items).await?.charged_count, 3);
                     Ok(())
                 })
                 .await

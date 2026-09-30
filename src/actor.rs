@@ -15,6 +15,9 @@ use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::charging::{
+    ChargeOptions, ChargeResult, ChargingError, ChargingManager, ChargingStorageBackend, DEFAULT_DATASET_ITEM_EVENT,
+};
 use crate::client::{RateLimitCounter, new_client};
 use crate::configuration::Configuration;
 use crate::input::{ActorInputError, ActorInputErrorCode, Input, InputSchema};
@@ -114,6 +117,7 @@ struct Inner {
     client: ApifyClient,
     storage: Arc<dyn StorageBackend>,
     smart: Option<Arc<SmartStorageBackend>>,
+    charging: Arc<ChargingManager>,
     services: Services,
     exiting: AtomicBool,
     rebooting: AtomicBool,
@@ -150,6 +154,8 @@ pub enum InitError {
     ServicesAlreadySet,
     #[error(transparent)]
     Storage(#[from] crawlee::core::StorageError),
+    #[error(transparent)]
+    Charging(#[from] ChargingError),
 }
 
 /// Runs `user_function` as an Actor: [`Actor::init`], the function, then [`Actor::exit`]. When
@@ -230,13 +236,23 @@ impl Actor {
         );
 
         let client = new_client(&configuration, None, RateLimitCounter::default());
+        let charging = Arc::new(ChargingManager::new(configuration.clone(), client.clone()));
         let (storage, smart): (Arc<dyn StorageBackend>, _) = match options.storage {
             Some(storage) => (storage, None),
             None => {
-                let cloud = Arc::new(
+                let cloud: Arc<dyn StorageBackend> = Arc::new(
                     ApifyStorageBackend::new(configuration.clone()).request_queue_access(options.request_queue_access),
                 );
                 let local = SmartStorageBackend::local_backend(&configuration);
+                // The default datasets charge for their items under pay-per-event pricing.
+                let charged = |inner| -> Arc<dyn StorageBackend> {
+                    Arc::new(ChargingStorageBackend {
+                        inner,
+                        charging: charging.clone(),
+                        default_dataset_id: configuration.default_dataset_id.clone(),
+                    })
+                };
+                let (cloud, local) = (charged(cloud), charged(local));
                 let smart = Arc::new(SmartStorageBackend::new(configuration.clone(), cloud, local));
                 (smart.clone(), Some(smart))
             }
@@ -257,6 +273,7 @@ impl Actor {
                 client,
                 storage,
                 smart,
+                charging,
                 services,
                 exiting: AtomicBool::new(false),
                 rebooting: AtomicBool::new(false),
@@ -297,6 +314,13 @@ impl Actor {
         }
 
         actor.inner.services.purge_on_start().await?;
+        actor.inner.charging.init(actor.inner.storage.as_ref()).await?;
+        if actor.inner.charging.is_pay_per_event() && actor.inner.smart.is_none() {
+            tracing::warn!(
+                "Items pushed to the default dataset will not be charged for, because this run does not use Apify \
+                 storage - the platform only counts items it stores itself."
+            );
+        }
         // Only the first `init` of the process gets here.
         let _ = CURRENT.set(actor.clone());
         Ok(actor)
@@ -503,9 +527,68 @@ impl Actor {
         RequestQueue::open(self.storage_for(options)?, id).await
     }
 
-    /// Pushes one item (an object) or several (an array) to the default dataset.
-    pub async fn push_data<T: serde::Serialize + ?Sized>(&self, data: &T) -> crawlee::core::StorageResult<()> {
-        self.inner.services.open_dataset(&StorageIdentifier::Default).await?.push_data(data).await
+    /// The pay-per-event charges of the run.
+    pub fn charging_manager(&self) -> &Arc<ChargingManager> {
+        &self.inner.charging
+    }
+
+    /// Charges for `count` events of `event_name` (see [`ChargingManager::charge`]).
+    pub async fn charge(&self, options: ChargeOptions) -> Result<ChargeResult, ChargingError> {
+        self.inner.charging.charge(options).await
+    }
+
+    /// Pushes one item (an object) or several (an array) to the default dataset. Under
+    /// pay-per-event pricing, only as many items are stored as the budget allows, each charged as
+    /// an `apify-default-dataset-item` event.
+    pub async fn push_data<T: serde::Serialize + ?Sized>(&self, data: &T) -> Result<ChargeResult, ChargingError> {
+        let dataset = self.inner.services.open_dataset(&StorageIdentifier::Default).await?;
+        let charging = &self.inner.charging;
+        charging
+            .with_charge_lock(async {
+                // The dataset charges the per-item event for what it stores.
+                let before = charging.charged_event_count(DEFAULT_DATASET_ITEM_EVENT);
+                dataset.push_data(data).await?;
+                Ok(ChargeResult {
+                    event_charge_limit_reached: charging.is_event_charge_limit_reached(DEFAULT_DATASET_ITEM_EVENT),
+                    charged_count: charging.charged_event_count(DEFAULT_DATASET_ITEM_EVENT) - before,
+                    chargeable_within_limit: charging.chargeable_within_limit(),
+                })
+            })
+            .await
+    }
+
+    /// Pushes items to the default dataset and charges `event_name` for each, as many as the
+    /// budget allows (`Actor.pushData(items, eventName)` in JS).
+    pub async fn push_data_and_charge<T: serde::Serialize + ?Sized>(
+        &self,
+        data: &T,
+        event_name: &str,
+    ) -> Result<ChargeResult, ChargingError> {
+        if event_name.starts_with("apify-") {
+            return Err(ChargingError::SyntheticEvent(event_name.to_owned()));
+        }
+        let mut items = match serde_json::to_value(data)? {
+            Value::Array(items) => items,
+            item => vec![item],
+        };
+        let dataset = self.inner.services.open_dataset(&StorageIdentifier::Default).await?;
+        let charging = &self.inner.charging;
+        charging
+            .with_charge_lock(async {
+                // Storing an item also charges the per-item event when the dataset is the Actor's own.
+                let limit = charging.push_data_limit(items.len(), Some(event_name), self.inner.smart.is_some());
+                if limit == 0 {
+                    return Ok(ChargeResult {
+                        event_charge_limit_reached: !items.is_empty(),
+                        charged_count: 0,
+                        chargeable_within_limit: charging.chargeable_within_limit(),
+                    });
+                }
+                items.truncate(limit);
+                dataset.push_data(&items).await?;
+                charging.charge(ChargeOptions::new(event_name, limit as u64)).await
+            })
+            .await
     }
 
     /// A value of the default key-value store.

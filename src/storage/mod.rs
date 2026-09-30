@@ -314,7 +314,7 @@ impl StorageBackend for ApifyStorageBackend {
 /// The storage backend of an Actor: [`ApifyStorageBackend`] on the platform, `local` elsewhere,
 /// except for storages opened with `force_cloud`.
 pub struct SmartStorageBackend {
-    cloud: Arc<ApifyStorageBackend>,
+    cloud: Arc<dyn StorageBackend>,
     local: Arc<dyn StorageBackend>,
     configuration: Arc<Configuration>,
 }
@@ -322,7 +322,7 @@ pub struct SmartStorageBackend {
 impl SmartStorageBackend {
     pub fn new(
         configuration: Arc<Configuration>,
-        cloud: Arc<ApifyStorageBackend>,
+        cloud: Arc<dyn StorageBackend>,
         local: Arc<dyn StorageBackend>,
     ) -> Self {
         SmartStorageBackend { cloud, local, configuration }
@@ -347,10 +347,6 @@ impl SmartStorageBackend {
         let cloud = Arc::new(ApifyStorageBackend::new(configuration.clone()));
         let local = Self::local_backend(&configuration);
         SmartStorageBackend::new(configuration, cloud, local)
-    }
-
-    pub fn cloud(&self) -> &Arc<ApifyStorageBackend> {
-        &self.cloud
     }
 
     /// The backend storages are opened through: the cloud one on the platform or with
