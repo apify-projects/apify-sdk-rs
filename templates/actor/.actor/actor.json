@@ -1,0 +1,10 @@
+{
+    "actorSpecification": 1,
+    "name": "crawlee-rs-actor",
+    "title": "crawlee-rs Actor",
+    "description": "Crawls websites with crawlee-rs and saves the title of every page.",
+    "version": "0.1",
+    "buildTag": "latest",
+    "input": "./input_schema.json",
+    "dockerfile": "../Dockerfile"
+}

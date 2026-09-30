@@ -17,6 +17,26 @@ The crate is not on crates.io yet. Depend on it by git:
 apify = { git = "https://github.com/apify-projects/apify-sdk-rs" }
 ```
 
+## Usage
+
+```rust
+#[tokio::main]
+async fn main() {
+    apify::main(|actor| async move {
+        let input: serde_json::Value = actor.get_input().await?;
+        // Crawlers built from here on store their data where the Actor does: in the platform
+        // storages on Apify, in ./storage elsewhere.
+        actor.push_data(&input).await?;
+        Ok(())
+    })
+    .await;
+}
+```
+
+`templates/actor` is a complete Actor (Dockerfile, `.actor/actor.json`, input schema) with a
+crawlee-rs crawler. Use crawlee-rs through `apify::crawlee`, so that the SDK and the crawler
+share one version of it.
+
 ## Development
 
 ```bash

@@ -1,0 +1,22 @@
+{
+    "title": "crawlee-rs Actor input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "startUrls": {
+            "title": "Start URLs",
+            "type": "array",
+            "description": "URLs to start the crawl with.",
+            "editor": "requestListSources",
+            "prefill": [{ "url": "https://crawlee.dev" }],
+            "default": [{ "url": "https://crawlee.dev" }]
+        },
+        "maxRequestsPerCrawl": {
+            "title": "Max pages",
+            "type": "integer",
+            "description": "How many pages to crawl at most.",
+            "minimum": 1,
+            "default": 20
+        }
+    }
+}

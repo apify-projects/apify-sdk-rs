@@ -19,3 +19,7 @@ pub use crate::input::{ActorInputError, ActorInputErrorCode, Input};
 pub use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 
 pub use apify_client::ApifyClient;
+
+/// The crawlee-rs version this SDK is built on. Use it through this re-export, so that the
+/// crawler and the SDK share one version of crawlee-rs.
+pub use crawlee;
