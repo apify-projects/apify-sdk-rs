@@ -247,6 +247,28 @@ async fn local_pay_per_event_runs_log_their_charges() {
     assert_eq!(log["chargedCount"], 3);
 }
 
+#[tokio::test]
+async fn secret_input_fields_are_decrypted() {
+    let api = FakeApi::start().await;
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/input_secrets.json")).unwrap();
+    api.put_record(DEFAULT_STORE, "INPUT", fixture["encrypted"].to_string().as_bytes(), "application/json");
+    let dir = tempfile::tempdir().unwrap();
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_INPUT_SECRETS_PRIVATE_KEY_FILE", fixture["privateKeyFile"].as_str().unwrap().to_owned()));
+    vars.push(("APIFY_INPUT_SECRETS_PRIVATE_KEY_PASSPHRASE", "pwd1234".to_owned()));
+    assert_exit(&run_child("echo", &vars, dir.path()).await, 0);
+    assert_eq!(api.dataset_items(DEFAULT_DATASET), [json!({ "echo": fixture["decrypted"] })]);
+
+    // A wrong passphrase fails the input.
+    let vars: Vec<_> = vars
+        .into_iter()
+        .map(|(name, value)| if name.ends_with("PASSPHRASE") { (name, "wrong".to_owned()) } else { (name, value) })
+        .collect();
+    let output = run_child("echo", &vars, dir.path()).await;
+    assert_exit(&output, 91);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Failed to decrypt the secret fields of the input."));
+}
+
 /// The scenarios, run by [`run_child`]. Does nothing in a normal test run.
 #[test]
 fn child() {

@@ -636,7 +636,32 @@ impl Actor {
                 format!("Input does not exist. Expected {}.", locations.join(" or ")),
             ));
         };
+        let input = self.decrypt_secrets(input)?;
         Ok(self.with_schema_defaults(input))
+    }
+
+    /// Decrypts the secret fields, when the platform passed the key.
+    fn decrypt_secrets(&self, input: Input) -> Result<Input, ActorInputError> {
+        let configuration = &self.inner.configuration;
+        let (Some(key_file), Some(passphrase)) =
+            (&configuration.input_secrets_private_key_file, &configuration.input_secrets_private_key_passphrase)
+        else {
+            return Ok(input);
+        };
+        let Input::Json(Value::Object(object)) = input else { return Ok(input) };
+        if object.is_empty() {
+            return Ok(Input::Json(Value::Object(object)));
+        }
+        let failed = |err: crate::input_secrets::SecretsError| {
+            ActorInputError::new(
+                ActorInputErrorCode::DecryptionFailed,
+                "Failed to decrypt the secret fields of the input.",
+            )
+            .caused_by(err)
+        };
+        let key = crate::input_secrets::InputSecretsKey::from_base64_pem(key_file, passphrase).map_err(failed)?;
+        let decrypted = crate::input_secrets::decrypt_input_secrets(object, &key).map_err(failed)?;
+        Ok(Input::Json(Value::Object(decrypted)))
     }
 
     /// The input of the run as `T`, from JSON (see [`get_input_raw`](Self::get_input_raw)).

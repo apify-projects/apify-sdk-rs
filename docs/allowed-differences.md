@@ -34,3 +34,14 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   configuration, whatever the Actor was configured with.
 - **Shared request queues can prolong locks.** `extend_request_processing_time` prolongs the
   platform lock of a request in progress; the JS SDK never prolongs locks.
+
+## Input
+
+- **Encrypted PKCS#8 keys are not supported for input secrets.** The platform's key is a legacy
+  encrypted PKCS#1 PEM (DES-EDE3-CBC), which is supported, as are AES-CBC encrypted and
+  unencrypted keys. Node.js also reads `BEGIN ENCRYPTED PRIVATE KEY` PEMs.
+- **Pseudo-URLs escape characters above U+00FF correctly.** `purlToRegExp` writes them as
+  `\xHHHH`, which a JavaScript regex reads as `\xHH` followed by two literal characters, so such
+  pseudo-URLs never match. Here they match the character.
+- **Pseudo-URL `[regex]` sections use the syntax of the `regex` crate.** Lookarounds and
+  backreferences of JavaScript regexes are not supported.

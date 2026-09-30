@@ -9,9 +9,11 @@ pub mod client;
 pub mod configuration;
 pub mod events;
 pub mod input;
+pub mod input_secrets;
 pub mod platform;
 pub mod proxy;
 pub mod storage;
+pub mod url_filters;
 
 pub use crate::actor::{
     Actor, ExitOptions, InitError, InitOptions, OpenOptions, StatusMessageOptions, exit_codes, main, main_with,

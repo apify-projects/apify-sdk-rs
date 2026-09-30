@@ -16,15 +16,23 @@ crawlee = { git = "https://github.com/apify-projects/crawlee-rs", rev = "bfea425
 # `client::ReqwestBackend` on the reqwest version crawlee-rs uses.
 apify-client = { git = "https://github.com/apify/apify-client-rust", rev = "8a4d19753448bbe0c443cfba04824dfcba4be252", default-features = false }
 
+aes = "0.8"
+aes-gcm = "0.10"
 anyhow = "1"
 async-trait = "0.1"
+aws-lc-rs = "1"
+base64 = "0.22"
 bytes = "1"
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+cbc = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+des = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 indexmap = "2"
 lru = "0.16"
+md-5 = "0.10"
 parking_lot = "0.12"
 rand = "0.9"
+regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "gzip", "brotli", "deflate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
@@ -36,7 +44,6 @@ tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
-base64 = "0.22"
 axum = "0.8"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
