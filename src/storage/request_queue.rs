@@ -1,7 +1,8 @@
 //! Request queues on the Apify platform.
 //!
-//! Only the single-consumer mode is implemented so far: [`ApifySingleRequestQueue`], a port of
-//! `ApifyRequestQueueSingleBackend` of the JS SDK.
+//! Two modes, ported from the JS SDK: [`ApifySingleRequestQueue`] (one consumer, no locks) and
+//! [`ApifySharedRequestQueue`](super::request_queue_shared::ApifySharedRequestQueue) (any number
+//! of consumers, requests locked on the platform).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
@@ -29,8 +30,8 @@ pub enum RequestQueueAccess {
     /// fewer API calls. The default.
     #[default]
     Single,
-    /// Any number of consumers, with requests locked on the platform while they are processed.
-    /// Not implemented yet: queues are opened in the single mode.
+    /// Any number of consumers, with requests locked on the platform while they are processed. Costs
+    /// about one more API call per request.
     Shared,
 }
 
@@ -49,6 +50,99 @@ fn to_api_request(request: &Request) -> StorageResult<RequestQueueRequest> {
 
 fn from_api_request(request: RequestQueueRequest) -> StorageResult<Request> {
     Ok(serde_json::from_value(serde_json::to_value(request)?)?)
+}
+
+pub(super) async fn get_request_by_id(client: &RequestQueueClient, id: &str) -> StorageResult<Option<Request>> {
+    match client.get_request(id).await.map_err(backend_error)? {
+        Some(request) => Ok(Some(from_api_request(request)?)),
+        None => Ok(None),
+    }
+}
+
+pub(super) async fn update_request(
+    client: &RequestQueueClient,
+    request: &Request,
+    forefront: bool,
+) -> StorageResult<QueueOperationInfo> {
+    let info = client.update_request(&to_api_request(request)?, forefront).await.map_err(backend_error)?;
+    Ok(QueueOperationInfo {
+        request_id: info.request_id,
+        was_already_present: info.was_already_present,
+        was_already_handled: info.was_already_handled,
+    })
+}
+
+/// Adds requests on the platform, which assigns their ids.
+pub(super) async fn send_batch(
+    client: &RequestQueueClient,
+    requests: &[Request],
+    forefront: bool,
+) -> StorageResult<BatchAddRequestsResult> {
+    let api_requests = requests
+        .iter()
+        .map(|request| {
+            let mut api_request = to_api_request(request)?;
+            api_request.id = None;
+            Ok(api_request)
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    let options = BatchAddRequestsOptions { forefront, ..BatchAddRequestsOptions::default() };
+    let added = client.batch_add_requests(&api_requests, options).await.map_err(backend_error)?;
+    Ok(BatchAddRequestsResult {
+        processed_requests: added
+            .processed_requests
+            .into_iter()
+            .filter_map(|processed| {
+                let unique_key = processed.unique_key?;
+                Some(ProcessedRequest {
+                    request_id: processed.request_id.unwrap_or_else(|| unique_key_to_request_id(&unique_key)),
+                    unique_key,
+                    was_already_present: processed.was_already_present.unwrap_or(false),
+                    was_already_handled: processed.was_already_handled.unwrap_or(false),
+                })
+            })
+            .collect(),
+        unprocessed_requests: added
+            .unprocessed_requests
+            .into_iter()
+            .map(|unprocessed| UnprocessedRequest {
+                unique_key: unprocessed.unique_key,
+                url: unprocessed.url,
+                method: unprocessed.method,
+            })
+            .collect(),
+    })
+}
+
+/// The queue's metadata, with counters no lower than the local estimates (the platform's lag).
+pub(super) async fn queue_metadata(
+    client: &RequestQueueClient,
+    estimated_total: u64,
+    estimated_handled: u64,
+) -> StorageResult<RequestQueueInfo> {
+    let queue = client
+        .get()
+        .await
+        .map_err(backend_error)?
+        .ok_or_else(|| StorageError::NotFound("Request queue not found or has been deleted.".to_owned()))?;
+    Ok(RequestQueueInfo {
+        created_at: date(queue.created_at),
+        modified_at: date(queue.modified_at),
+        accessed_at: extra_date(&queue.extra, "accessedAt"),
+        total_request_count: (queue.total_request_count.unwrap_or(0).max(0) as u64).max(estimated_total),
+        handled_request_count: extra_u64(&queue.extra, "handledRequestCount").max(estimated_handled),
+        pending_request_count: extra_u64(&queue.extra, "pendingRequestCount"),
+        id: queue.id,
+        name: queue.name,
+    })
+}
+
+pub(super) const PURGE_UNSUPPORTED: &str = "Purging a request queue is not supported on the Apify platform. \
+     Use `drop()` to delete the queue entirely, or open a new queue instead.";
+
+/// Counts the requests a batch add actually added.
+pub(super) fn newly_added(result: &BatchAddRequestsResult) -> u64 {
+    result.processed_requests.iter().filter(|p| !p.was_already_present && !p.was_already_handled).count() as u64
 }
 
 /// What this client knows about the queue.
@@ -112,19 +206,11 @@ impl ApifySingleRequestQueue {
     }
 
     async fn get_request_by_id(&self, id: &str) -> StorageResult<Option<Request>> {
-        match self.client.get_request(id).await.map_err(backend_error)? {
-            Some(request) => Ok(Some(from_api_request(request)?)),
-            None => Ok(None),
-        }
+        get_request_by_id(&self.client, id).await
     }
 
     async fn update_request(&self, request: &Request, forefront: bool) -> StorageResult<QueueOperationInfo> {
-        let info = self.client.update_request(&to_api_request(request)?, forefront).await.map_err(backend_error)?;
-        Ok(QueueOperationInfo {
-            request_id: info.request_id,
-            was_already_present: info.was_already_present,
-            was_already_handled: info.was_already_handled,
-        })
+        update_request(&self.client, request, forefront).await
     }
 
     /// One-time prefetch of the queue contents, so that the requests a resurrected run adds again
@@ -188,26 +274,11 @@ impl ApifySingleRequestQueue {
 #[async_trait]
 impl RequestQueueBackend for ApifySingleRequestQueue {
     async fn get_metadata(&self) -> StorageResult<RequestQueueInfo> {
-        let queue = self
-            .client
-            .get()
-            .await
-            .map_err(backend_error)?
-            .ok_or_else(|| StorageError::NotFound("Request queue not found or has been deleted.".to_owned()))?;
         let (estimated_total, estimated_handled) = {
             let state = self.state.lock();
             (state.estimated_total, state.estimated_handled)
         };
-        Ok(RequestQueueInfo {
-            created_at: date(queue.created_at),
-            modified_at: date(queue.modified_at),
-            accessed_at: extra_date(&queue.extra, "accessedAt"),
-            total_request_count: (queue.total_request_count.unwrap_or(0).max(0) as u64).max(estimated_total),
-            handled_request_count: extra_u64(&queue.extra, "handledRequestCount").max(estimated_handled),
-            pending_request_count: extra_u64(&queue.extra, "pendingRequestCount"),
-            id: queue.id,
-            name: queue.name,
-        })
+        queue_metadata(&self.client, estimated_total, estimated_handled).await
     }
 
     async fn drop_storage(&self) -> StorageResult<()> {
@@ -215,10 +286,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
     }
 
     async fn purge(&self) -> StorageResult<()> {
-        Err(unsupported(
-            "Purging a request queue is not supported on the Apify platform. \
-             Use `drop()` to delete the queue entirely, or open a new queue instead.",
-        ))
+        Err(unsupported(PURGE_UNSUPPORTED))
     }
 
     async fn add_batch_of_requests(
@@ -258,40 +326,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
 
         let mut result = BatchAddRequestsResult::default();
         if !new_requests.is_empty() {
-            // The platform assigns the ids.
-            let api_requests = new_requests
-                .iter()
-                .map(|request| {
-                    let mut api_request = to_api_request(request)?;
-                    api_request.id = None;
-                    Ok(api_request)
-                })
-                .collect::<StorageResult<Vec<_>>>()?;
-            let options = BatchAddRequestsOptions { forefront, ..BatchAddRequestsOptions::default() };
-            let added = self.client.batch_add_requests(&api_requests, options).await.map_err(backend_error)?;
-
-            result.processed_requests = added
-                .processed_requests
-                .into_iter()
-                .filter_map(|processed| {
-                    let unique_key = processed.unique_key?;
-                    Some(ProcessedRequest {
-                        request_id: processed.request_id.unwrap_or_else(|| unique_key_to_request_id(&unique_key)),
-                        unique_key,
-                        was_already_present: processed.was_already_present.unwrap_or(false),
-                        was_already_handled: processed.was_already_handled.unwrap_or(false),
-                    })
-                })
-                .collect();
-            result.unprocessed_requests = added
-                .unprocessed_requests
-                .into_iter()
-                .map(|unprocessed| UnprocessedRequest {
-                    unique_key: unprocessed.unique_key,
-                    url: unprocessed.url,
-                    method: unprocessed.method,
-                })
-                .collect();
+            result = send_batch(&self.client, &new_requests, forefront).await?;
 
             // The platform's answer is authoritative: a request it reports as handled (by an
             // earlier run, beyond the prefetch limit) must not enter the head again.
@@ -311,12 +346,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
         }
 
         result.processed_requests.extend(already_present);
-        let new_count = result
-            .processed_requests
-            .iter()
-            .filter(|processed| !processed.was_already_present && !processed.was_already_handled)
-            .count();
-        self.state.lock().estimated_total += new_count as u64;
+        self.state.lock().estimated_total += newly_added(&result);
         Ok(result)
     }
 

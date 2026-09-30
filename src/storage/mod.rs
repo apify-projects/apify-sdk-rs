@@ -4,6 +4,7 @@
 mod dataset;
 mod key_value_store;
 mod request_queue;
+mod request_queue_shared;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -292,10 +293,10 @@ impl StorageBackend for ApifyStorageBackend {
     ) -> StorageResult<Arc<dyn RequestQueueBackend>> {
         let id = self.resolve_id(id, StorageKind::RequestQueue).await?;
         let client = self.client.request_queue(id).with_client_key(self.client_key.clone());
-        if self.request_queue_access == RequestQueueAccess::Shared {
-            tracing::warn!("Shared request queue access is not implemented yet; using single access");
-        }
-        Ok(Arc::new(request_queue::ApifySingleRequestQueue::new(client)))
+        Ok(match self.request_queue_access {
+            RequestQueueAccess::Single => Arc::new(request_queue::ApifySingleRequestQueue::new(client)),
+            RequestQueueAccess::Shared => Arc::new(request_queue_shared::ApifySharedRequestQueue::new(client)),
+        })
     }
 
     /// Whether `id` is the id of a storage (the API also finds storages by name).

@@ -38,6 +38,8 @@ struct Store {
 struct QueuedRequest {
     body: Value,
     order: i64,
+    /// The client holding the lock, and until when.
+    lock: Option<(String, std::time::Instant)>,
     /// The head listing number from which the request shows in the head.
     visible_from: u64,
 }
@@ -75,6 +77,8 @@ struct Data {
     calls: Vec<String>,
     /// Bodies of run updates, in order.
     run_updates: Vec<Value>,
+    /// Starts, aborts, metamorphs and webhooks: `(call, query, body)`.
+    platform_calls: Vec<(String, HashMap<String, String>, Value)>,
 }
 
 impl Data {
@@ -123,10 +127,21 @@ impl FakeApi {
             .route("/v2/request-queues", post(create_queue))
             .route("/v2/request-queues/{id}", get(get_queue).delete(delete_queue))
             .route("/v2/request-queues/{id}/head", get(list_head))
+            .route("/v2/request-queues/{id}/head/lock", post(list_and_lock_head))
+            .route(
+                "/v2/request-queues/{id}/requests/{request_id}/lock",
+                axum::routing::put(prolong_lock).delete(delete_lock),
+            )
             .route("/v2/request-queues/{id}/requests", get(list_requests))
             .route("/v2/request-queues/{id}/requests/batch", post(batch_add))
             .route("/v2/request-queues/{id}/requests/{request_id}", get(get_request).put(update_request))
-            .route("/v2/actor-runs/{id}", axum::routing::put(update_run))
+            .route("/v2/users/me", get(get_me))
+            .route("/v2/actor-runs/{id}", axum::routing::put(update_run).get(get_run))
+            .route("/v2/actor-runs/{id}/abort", post(run_action))
+            .route("/v2/actor-runs/{id}/metamorph", post(run_action))
+            .route("/v2/actors/{id}/runs", post(start_run))
+            .route("/v2/actor-tasks/{id}/runs", post(start_run))
+            .route("/v2/webhooks", post(create_webhook))
             .route("/v2/actor-runs/{id}/reboot", post(reboot_run))
             .layer(tower_http::decompression::RequestDecompressionLayer::new())
             .layer(middleware::from_fn_with_state(shared.clone(), gate))
@@ -195,7 +210,11 @@ impl FakeApi {
         let order = queue.order(false);
         let visible_from = queue.head_listings + u64::from(lag);
         let body = json!({ "id": id, "url": url, "uniqueKey": url, "method": "GET", "retryCount": 0 });
-        queue.requests.insert(id, QueuedRequest { body, order, visible_from });
+        queue.requests.insert(id, QueuedRequest { body, order, visible_from, lock: None });
+    }
+
+    pub fn platform_calls(&self) -> Vec<(String, HashMap<String, String>, Value)> {
+        self.shared.data.lock().platform_calls.clone()
     }
 
     pub fn run_updates(&self) -> Vec<Value> {
@@ -515,7 +534,9 @@ async fn batch_add(
                 request["id"] = json!(request_id);
                 let order = queue.order(forefront);
                 let visible_from = queue.head_listings + u64::from(lag);
-                queue.requests.insert(request_id.clone(), QueuedRequest { body: request, order, visible_from });
+                queue
+                    .requests
+                    .insert(request_id.clone(), QueuedRequest { body: request, order, visible_from, lock: None });
                 (false, false)
             }
         };
@@ -551,13 +572,18 @@ async fn update_request(
     let (present, handled) = match queue.requests.get_mut(&request_id) {
         Some(existing) => {
             let handled = !existing.body["handledAt"].is_null();
+            if !request["handledAt"].is_null() {
+                existing.lock = None;
+            }
             existing.body = request;
             existing.order = order;
             existing.visible_from = listing;
             (true, handled)
         }
         None => {
-            queue.requests.insert(request_id.clone(), QueuedRequest { body: request, order, visible_from: listing });
+            queue
+                .requests
+                .insert(request_id.clone(), QueuedRequest { body: request, order, visible_from: listing, lock: None });
             (false, false)
         }
     };
@@ -603,4 +629,116 @@ pub async fn serve_events(delay: std::time::Duration, messages: Vec<Value>) -> S
         while let Some(Ok(_)) = socket.next().await {}
     });
     url
+}
+
+async fn get_me() -> Response {
+    envelope(StatusCode::OK, json!({ "id": "user", "username": "tester", "proxy": { "password": "proxy-secret" } }))
+}
+
+fn record_platform_call(shared: &Shared, call: String, query: HashMap<String, String>, body: &[u8]) {
+    let body = serde_json::from_slice(body).unwrap_or(Value::Null);
+    shared.data.lock().platform_calls.push((call, query, body));
+}
+
+async fn start_run(
+    State(shared): State<Shared>,
+    uri: axum::http::Uri,
+    Query(query): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    record_platform_call(&shared, uri.path().to_owned(), query, &body);
+    envelope(StatusCode::CREATED, json!({ "id": "started-run", "status": "READY" }))
+}
+
+async fn get_run(Path(id): Path<String>) -> Response {
+    envelope(StatusCode::OK, json!({ "id": id, "status": "SUCCEEDED" }))
+}
+
+async fn run_action(
+    State(shared): State<Shared>,
+    uri: axum::http::Uri,
+    Query(query): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    record_platform_call(&shared, uri.path().to_owned(), query, &body);
+    envelope(StatusCode::OK, json!({ "id": "run", "status": "ABORTING" }))
+}
+
+async fn create_webhook(State(shared): State<Shared>, body: Bytes) -> Response {
+    record_platform_call(&shared, "/v2/webhooks".to_owned(), HashMap::new(), &body);
+    envelope(StatusCode::CREATED, json!({ "id": "webhook-1" }))
+}
+
+impl QueuedRequest {
+    fn locked_by_other(&self, client_key: &str) -> bool {
+        self.lock.as_ref().is_some_and(|(key, until)| key != client_key && *until > std::time::Instant::now())
+    }
+
+    fn is_locked(&self) -> bool {
+        self.lock.as_ref().is_some_and(|(_, until)| *until > std::time::Instant::now())
+    }
+}
+
+async fn list_and_lock_head(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mut data = shared.data.lock();
+    let Some(queue) = data.queues.get_mut(&id) else { return not_found() };
+    let client_key = query.get("clientKey").cloned().unwrap_or_default();
+    let limit = number(&query, "limit").unwrap_or(25);
+    let lock_secs = number(&query, "lockSecs").unwrap_or(60) as u64;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(lock_secs);
+    let mut pending: Vec<&mut QueuedRequest> =
+        queue.requests.values_mut().filter(|r| r.body["handledAt"].is_null() && !r.is_locked()).collect();
+    pending.sort_by_key(|r| r.order);
+    let mut items = Vec::new();
+    for request in pending.into_iter().take(limit) {
+        request.lock = Some((client_key.clone(), until));
+        let b = &request.body;
+        items.push(json!({ "id": b["id"], "uniqueKey": b["uniqueKey"], "url": b["url"], "method": b["method"] }));
+    }
+    let has_locked = queue.requests.values().any(|r| r.body["handledAt"].is_null() && r.is_locked());
+    envelope(
+        StatusCode::OK,
+        json!({ "limit": limit, "lockSecs": lock_secs, "queueHasLockedRequests": has_locked, "clientKey": client_key,
+                "hadMultipleClients": true, "items": items }),
+    )
+}
+
+async fn prolong_lock(
+    State(shared): State<Shared>,
+    Path((id, request_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mut data = shared.data.lock();
+    let client_key = query.get("clientKey").cloned().unwrap_or_default();
+    let lock_secs = number(&query, "lockSecs").unwrap_or(60) as u64;
+    let Some(request) = data.queues.get_mut(&id).and_then(|q| q.requests.get_mut(&request_id)) else {
+        return not_found();
+    };
+    if request.locked_by_other(&client_key) {
+        return error(StatusCode::FORBIDDEN, "request-locked");
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(lock_secs);
+    request.lock = Some((client_key, until));
+    envelope(StatusCode::OK, json!({ "lockExpiresAt": NOW }))
+}
+
+async fn delete_lock(
+    State(shared): State<Shared>,
+    Path((id, request_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mut data = shared.data.lock();
+    let client_key = query.get("clientKey").cloned().unwrap_or_default();
+    let Some(request) = data.queues.get_mut(&id).and_then(|q| q.requests.get_mut(&request_id)) else {
+        return not_found();
+    };
+    if request.locked_by_other(&client_key) {
+        return error(StatusCode::FORBIDDEN, "request-locked");
+    }
+    request.lock = None;
+    StatusCode::NO_CONTENT.into_response()
 }

@@ -287,3 +287,60 @@ async fn the_smart_backend_is_local_off_the_platform() {
     store.set_value("OUTPUT", &json!(2)).await.unwrap();
     assert!(api.record(DEFAULT_STORE, "OUTPUT").is_some());
 }
+
+fn shared_services(api: &FakeApi, run_id: &str) -> Services {
+    let configuration =
+        Arc::new(Configuration { actor_run_id: Some(run_id.to_owned()), ..(*configuration(api, true)).clone() });
+    let backend = ApifyStorageBackend::new(configuration).request_queue_access(apify::RequestQueueAccess::Shared);
+    Services::new(Arc::new(backend))
+}
+
+#[tokio::test]
+async fn shared_queues_hand_each_request_to_one_consumer() {
+    let api = FakeApi::start().await;
+    let first = shared_services(&api, "run-a").open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let second = shared_services(&api, "run-b").open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let urls: Vec<crawlee::Request> = (0..60).map(|n| crawlee::Request::new(format!("https://a.test/{n}"))).collect();
+    first.add_requests(urls, false).await.unwrap();
+
+    let consume = |queue: crawlee::RequestQueue| async move {
+        let mut handled = Vec::new();
+        while !queue.is_finished().await.unwrap() {
+            let Some(mut request) = queue.fetch_next_request().await.unwrap() else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            handled.push(request.url.clone());
+            queue.mark_request_as_handled(&mut request).await.unwrap();
+        }
+        handled
+    };
+    let (a, b) = tokio::join!(consume(first.clone()), consume(second.clone()));
+    assert!(!a.is_empty() && !b.is_empty(), "both consumers got requests: {} + {}", a.len(), b.len());
+    let mut all: Vec<String> = a.into_iter().chain(b).collect();
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), 60, "every request handled exactly once");
+    assert_eq!(first.get_info().await.unwrap().handled_request_count, 60);
+}
+
+#[tokio::test]
+async fn a_reclaimed_shared_request_is_unlocked_for_others() {
+    let api = FakeApi::start().await;
+    let first = shared_services(&api, "run-a").open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let second = shared_services(&api, "run-b").open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    first.add_requests(vec!["https://a.test/only".into()], false).await.unwrap();
+
+    let request = first.fetch_next_request().await.unwrap().unwrap();
+    assert!(second.fetch_next_request().await.unwrap().is_none(), "locked by the first consumer");
+    assert!(!second.is_finished().await.unwrap(), "another consumer holds a lock");
+    let id = request.id.clone().unwrap();
+    assert!(first.backend().extend_request_processing_time(&id, std::time::Duration::from_secs(60)).await.unwrap());
+
+    first.reclaim_request(&request, false).await.unwrap();
+    let mut again = second.fetch_next_request().await.unwrap().expect("unlocked by the reclaim");
+    assert_eq!(again.url, "https://a.test/only");
+    second.mark_request_as_handled(&mut again).await.unwrap();
+    assert!(second.is_finished().await.unwrap());
+    assert!(first.is_finished().await.unwrap());
+}

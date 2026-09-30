@@ -26,3 +26,11 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   a process exit in Rust cuts off requests in flight.
 - **`Actor::current()` returns `Option`.** Before `Actor::init()` there is no Actor; the JS SDK
   warns and continues with an uninitialized one.
+- **`abort` sets the status message on the aborted run.** The JS SDK sets it on the current run.
+- **`get_env` falls back to the `APIFY_*` variables.** The JS SDK reads both generations of
+  variables into one object, and a missing `ACTOR_*` variable overwrites its `APIFY_*` predecessor
+  with `null`. Here the `ACTOR_*` variable is read first and the `APIFY_*` one is the fallback.
+- **`use_state` uses the Actor's services.** The JS SDK opens the store with the global
+  configuration, whatever the Actor was configured with.
+- **Shared request queues can prolong locks.** `extend_request_processing_time` prolongs the
+  platform lock of a request in progress; the JS SDK never prolongs locks.

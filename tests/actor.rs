@@ -164,6 +164,45 @@ async fn missing_input_and_late_init_are_errors() {
     assert_exit(&run_child("late-init", &[], dir.path()).await, 0);
 }
 
+#[tokio::test]
+async fn the_platform_api() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut vars = platform_env(&api, None);
+    vars.push(("ACTOR_TIMEOUT_AT", (chrono::Utc::now() + chrono::Duration::seconds(100)).to_rfc3339()));
+    assert_exit(&run_child("platform", &vars, dir.path()).await, 0);
+
+    let calls = api.platform_calls();
+    let paths: Vec<&str> = calls.iter().map(|(path, _, _)| path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/v2/actors/apify~hello-world/runs",
+            "/v2/actor-tasks/user~task/runs",
+            "/v2/actor-runs/other-run/abort",
+            "/v2/webhooks",
+            "/v2/actor-runs/run-1/metamorph",
+        ]
+    );
+    let (_, query, input) = &calls[0];
+    assert_eq!(input, &json!({ "a": 1 }));
+    let timeout: i64 = query["timeout"].parse().unwrap();
+    assert!((95..=100).contains(&timeout), "the remaining time of this run: {timeout}");
+    assert_eq!(calls[1].1["memory"], "512");
+    assert_eq!(calls[2].1["gracefully"], "1");
+    assert_eq!(
+        calls[3].2,
+        json!({ "eventTypes": ["ACTOR.RUN.SUCCEEDED"], "requestUrl": "https://example.com/hook", "isAdHoc": true,
+                "condition": { "actorRunId": "run-1" } })
+    );
+    assert_eq!(calls[4].1["targetActorId"], "apify~other");
+    // The status message of an aborted run goes to that run.
+    let updates = api.run_updates();
+    assert_eq!(updates, [json!({ "statusMessage": "Stopped by the parent", "isStatusMessageTerminal": true })]);
+    let (state, _) = api.record(DEFAULT_STORE, "APIFY_GLOBAL_STATE").expect("state saved");
+    assert_eq!(serde_json::from_slice::<Value>(&state).unwrap(), json!({ "calls": 5 }));
+}
+
 /// The scenarios, run by [`run_child`]. Does nothing in a normal test run.
 #[test]
 fn child() {
@@ -191,6 +230,34 @@ fn child() {
                     state.lock()["count"] = json!(1);
                     let wait = if scenario == "wait" { 60 } else { 2 };
                     tokio::time::sleep(Duration::from_secs(wait)).await;
+                    Ok(())
+                })
+                .await
+            }
+            "platform" => {
+                apify::main(|actor| async move {
+                    let state = actor.use_state(None, || json!({ "calls": 0 })).await?;
+                    let inherit =
+                        apify::CallOptions { timeout: Some(apify::RunTimeout::Inherit), ..Default::default() };
+                    let run = actor.call("apify/hello-world", Some(&json!({ "a": 1 })), inherit).await?;
+                    assert_eq!(run.status.as_deref(), Some("SUCCEEDED"));
+                    let mut options = apify::CallOptions::default();
+                    options.start.memory_mbytes = Some(512);
+                    actor.call_task("user/task", None::<&Value>, options).await?;
+                    let abort = apify::AbortOptions {
+                        status_message: Some("Stopped by the parent".to_owned()),
+                        gracefully: Some(true),
+                        ..Default::default()
+                    };
+                    actor.abort("other-run", abort).await?;
+                    let webhook = apify::WebhookOptions {
+                        event_types: vec!["ACTOR.RUN.SUCCEEDED".to_owned()],
+                        request_url: "https://example.com/hook".to_owned(),
+                        ..Default::default()
+                    };
+                    assert!(actor.add_webhook(webhook).await?.is_some());
+                    actor.metamorph("apify/other", None::<&Value>, Default::default()).await?;
+                    state.lock()["calls"] = json!(5);
                     Ok(())
                 })
                 .await
