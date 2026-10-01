@@ -4,6 +4,7 @@ on:
   push:
     branches: [master, main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -61,3 +62,28 @@ jobs:
           corepack enable && pnpm install --frozen-lockfile --ignore-scripts && pnpm compile
       - run: APIFY_SDK_JS_DIR=../apify-sdk-js node --no-warnings conformance/oracle/generate-golden.mts
       - run: git diff --exit-code conformance/golden
+
+  # Against the real API, with the APIFY_TOKEN secret (the tests skip without it).
+  live:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test live -- --nocapture
+
+  # Builds and runs the template as an Actor on the platform; minutes long, so on demand only.
+  e2e:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+      APIFY_E2E: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test e2e -- --nocapture
