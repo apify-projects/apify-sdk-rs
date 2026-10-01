@@ -4,9 +4,10 @@ Run [crawlee-rs](https://github.com/apify-projects/crawlee-rs) crawlers as Actor
 [Apify platform](https://apify.com). A port of the [JS SDK](https://github.com/apify/apify-sdk-js),
 using the Rust [Apify API client](https://github.com/apify/apify-client-rust).
 
-**Status: in development, not published.** See [docs/plan.md](docs/plan.md) for the scope and
-milestones, and [docs/allowed-differences.md](docs/allowed-differences.md) for deliberate
-differences from the JS SDK.
+**Status: feature-complete port, not yet published or run on the platform.** See
+[docs/plan.md](docs/plan.md) for the scope, and
+[docs/allowed-differences.md](docs/allowed-differences.md) for deliberate differences from the JS
+SDK.
 
 ## Install
 
@@ -17,32 +18,71 @@ The crate is not on crates.io yet. Depend on it by git:
 apify = { git = "https://github.com/apify-projects/apify-sdk-rs" }
 ```
 
+Use crawlee-rs through `apify::crawlee`, so that the SDK and your crawler share one version of it.
+
 ## Usage
 
 ```rust
+use apify::crawlee::{EnqueueLinksOptions, HtmlContext, HtmlCrawler};
+
 #[tokio::main]
 async fn main() {
     apify::main(|actor| async move {
         let input: serde_json::Value = actor.get_input().await?;
-        // Crawlers built from here on store their data where the Actor does: in the platform
-        // storages on Apify, in ./storage elsewhere.
-        actor.push_data(&input).await?;
+        let start = input["startUrl"].as_str().unwrap_or("https://crawlee.dev").to_owned();
+
+        // Crawlers store their data where the Actor does: in the platform storages on Apify,
+        // in ./storage elsewhere.
+        let crawler = HtmlCrawler::builder()
+            .services(actor.services().clone())
+            .request_handler(|ctx: HtmlContext| async move {
+                let title = ctx.with_html(|doc| doc.title()).await?;
+                ctx.push_data(&serde_json::json!({ "url": ctx.url().as_str(), "title": title }))?;
+                ctx.enqueue_links(EnqueueLinksOptions::new()).await?;
+                Ok(())
+            })
+            .build()?;
+        crawler.run([start]).await?;
         Ok(())
     })
     .await;
 }
 ```
 
-`templates/actor` is a complete Actor (Dockerfile, `.actor/actor.json`, input schema) with a
-crawlee-rs crawler. Use crawlee-rs through `apify::crawlee`, so that the SDK and the crawler
-share one version of it.
+[`templates/actor`](templates/actor) is a complete Actor: Dockerfile, `.actor/actor.json` and an
+input schema. Copy it and `apify push`.
 
-## Development
+## Features
+
+| | |
+|---|---|
+| **Lifecycle** | `apify::main`, `Actor::init` / `exit` / `fail` / `reboot`, exit codes (91 when the user function fails), a watchdog for hung exits, `Actor::current()` |
+| **Configuration** | Every `ACTOR_*` / `APIFY_*` variable of the JS SDK, with its precedence and defaults (all memory on the platform) |
+| **Storages** | Platform datasets, key-value stores and request queues behind the crawlee-rs storage traits; names, aliases (`ACTOR_STORAGES_JSON`, remembered across migrations), `force_cloud`; local files with the input kept on purge |
+| **Request queues** | Single-consumer mode (local head estimate, no locks) and shared mode (platform locks, prolonged for long requests) |
+| **Events** | The platform websocket relayed as crawlee-rs events: system info for autoscaling, `migrating` (state saved, run rebooted), `aborting` (graceful exit) |
+| **Input** | `get_input` from the store or `INPUT(.json)`, schema defaults applied locally, secret fields decrypted |
+| **Platform API** | `call`, `start`, `call_task`, `abort`, `metamorph`, `add_webhook`, `set_status_message` (crawler status forwarded), `get_env`, `use_state` |
+| **Proxy** | Apify Proxy (groups, country, password from the account, access check) and custom proxies, for crawlers |
+| **Charging** | Pay-per-event: budget limits, the `apify-default-dataset-item` event charged as items are stored, `push_data_and_charge`, the local charging log |
+| **URL filters** | Globs and pseudo-URLs with request options, as Actor inputs send them |
+| **Autoscaling** | Rate-limited API calls (429) count toward the storage load signal |
+
+## Testing
+
+| Layer | What runs | Needs |
+|---|---|---|
+| Unit and integration | Everything against a fake Apify API (lagging queue head, rate limits, locks); Actor scenarios in child processes | nothing |
+| Golden | Outputs recorded from the JS SDK, replayed ([conformance/](conformance)) | nothing (regenerating needs Node 22) |
+| Live | Storages and both queue modes against the real API ([tests/live.rs](tests/live.rs)) | `APIFY_TOKEN` |
+| End to end | The template built and run as an Actor, rebooted mid-crawl ([tests/e2e.rs](tests/e2e.rs)) | `APIFY_TOKEN`, `APIFY_E2E=1` |
 
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+APIFY_TOKEN=... cargo test --test live -- --nocapture
+APIFY_TOKEN=... APIFY_E2E=1 cargo test --test e2e -- --nocapture
 ```
 
 Minimum supported Rust version: 1.88.
