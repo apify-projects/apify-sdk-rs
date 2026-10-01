@@ -585,6 +585,15 @@ mod tests {
         assert_eq!(js_to_fixed(f64::INFINITY, 4), f64::INFINITY);
     }
 
+    #[test]
+    fn to_fixed_golden() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!("../conformance/golden/to_fixed.json")).unwrap();
+        for case in cases {
+            let (x, digits) = (case["x"].as_f64().unwrap(), case["digits"].as_u64().unwrap() as usize);
+            assert_eq!(js_to_fixed(x, digits), case["expected"].as_f64().unwrap(), "{x}.toFixed({digits})");
+        }
+    }
+
     fn manager(max: f64, prices: &[(&str, f64)], charged: &[(&str, u64)]) -> ChargingManager {
         let events: serde_json::Map<String, Value> = prices
             .iter()

@@ -1,0 +1,299 @@
+[
+  {
+    "name": "budget with the default dataset item event",
+    "env": {
+      "APIFY_IS_AT_HOME": "1",
+      "ACTOR_RUN_ID": "run",
+      "ACTOR_MAX_TOTAL_CHARGE_USD": "10",
+      "APIFY_ACTOR_PRICING_INFO": "{\"pricingModel\":\"PAY_PER_EVENT\",\"pricingPerEvent\":{\"actorChargeEvents\":{\"page\":{\"eventTitle\":\"page\",\"eventPriceUsd\":1},\"apify-default-dataset-item\":{\"eventTitle\":\"apify-default-dataset-item\",\"eventPriceUsd\":0.5}}}}",
+      "APIFY_CHARGED_ACTOR_EVENT_COUNTS": "{\"page\":3}"
+    },
+    "operations": [
+      {
+        "op": "maxCount",
+        "eventName": "page"
+      },
+      {
+        "op": "maxCount",
+        "eventName": "unknown"
+      },
+      {
+        "op": "pushDataLimit",
+        "itemsCount": 10,
+        "eventName": "page",
+        "isDefaultDataset": true
+      },
+      {
+        "op": "pushDataLimit",
+        "itemsCount": 3,
+        "eventName": "page",
+        "isDefaultDataset": true
+      },
+      {
+        "op": "pushDataLimit",
+        "itemsCount": 30,
+        "isDefaultDataset": true
+      },
+      {
+        "op": "charge",
+        "eventName": "page",
+        "count": 2
+      },
+      {
+        "op": "charge",
+        "eventName": "apify-default-dataset-item",
+        "count": 20
+      },
+      {
+        "op": "charge",
+        "eventName": "page",
+        "count": 1
+      },
+      {
+        "op": "pushDataLimit",
+        "itemsCount": 5,
+        "isDefaultDataset": true
+      },
+      {
+        "op": "charge",
+        "eventName": "unknown",
+        "count": 4
+      }
+    ],
+    "expected": [
+      7,
+      null,
+      4,
+      3,
+      14,
+      {
+        "eventChargeLimitReached": false,
+        "chargedCount": 2,
+        "chargeableWithinLimit": {
+          "page": 5,
+          "apify-default-dataset-item": 10
+        }
+      },
+      {
+        "eventChargeLimitReached": true,
+        "chargedCount": 11,
+        "chargeableWithinLimit": {
+          "page": 0,
+          "apify-default-dataset-item": 0
+        }
+      },
+      {
+        "eventChargeLimitReached": true,
+        "chargedCount": 0,
+        "chargeableWithinLimit": {
+          "page": 0,
+          "apify-default-dataset-item": 0
+        }
+      },
+      0,
+      {
+        "eventChargeLimitReached": false,
+        "chargedCount": 4,
+        "chargeableWithinLimit": {
+          "page": 0,
+          "apify-default-dataset-item": 0
+        }
+      }
+    ]
+  },
+  {
+    "name": "prices that do not add up in binary",
+    "env": {
+      "APIFY_IS_AT_HOME": "1",
+      "ACTOR_RUN_ID": "run",
+      "ACTOR_MAX_TOTAL_CHARGE_USD": "0.3",
+      "APIFY_ACTOR_PRICING_INFO": "{\"pricingModel\":\"PAY_PER_EVENT\",\"pricingPerEvent\":{\"actorChargeEvents\":{\"tenth\":{\"eventTitle\":\"tenth\",\"eventPriceUsd\":0.1},\"third\":{\"eventTitle\":\"third\",\"eventPriceUsd\":0.0333333}}}}",
+      "APIFY_CHARGED_ACTOR_EVENT_COUNTS": "{}"
+    },
+    "operations": [
+      {
+        "op": "charge",
+        "eventName": "tenth",
+        "count": 1
+      },
+      {
+        "op": "charge",
+        "eventName": "tenth",
+        "count": 1
+      },
+      {
+        "op": "maxCount",
+        "eventName": "tenth"
+      },
+      {
+        "op": "maxCount",
+        "eventName": "third"
+      },
+      {
+        "op": "charge",
+        "eventName": "third",
+        "count": 5
+      },
+      {
+        "op": "charge",
+        "eventName": "tenth",
+        "count": 1
+      }
+    ],
+    "expected": [
+      {
+        "eventChargeLimitReached": false,
+        "chargedCount": 1,
+        "chargeableWithinLimit": {
+          "tenth": 2,
+          "third": 6
+        }
+      },
+      {
+        "eventChargeLimitReached": false,
+        "chargedCount": 1,
+        "chargeableWithinLimit": {
+          "tenth": 1,
+          "third": 3
+        }
+      },
+      1,
+      3,
+      {
+        "eventChargeLimitReached": true,
+        "chargedCount": 4,
+        "chargeableWithinLimit": {
+          "tenth": 0,
+          "third": 0
+        }
+      },
+      {
+        "eventChargeLimitReached": true,
+        "chargedCount": 0,
+        "chargeableWithinLimit": {
+          "tenth": 0,
+          "third": 0
+        }
+      }
+    ]
+  },
+  {
+    "name": "no budget",
+    "env": {
+      "APIFY_IS_AT_HOME": "1",
+      "ACTOR_RUN_ID": "run",
+      "APIFY_ACTOR_PRICING_INFO": "{\"pricingModel\":\"PAY_PER_EVENT\",\"pricingPerEvent\":{\"actorChargeEvents\":{\"page\":{\"eventTitle\":\"page\",\"eventPriceUsd\":0.01}}}}",
+      "APIFY_CHARGED_ACTOR_EVENT_COUNTS": "{\"page\":100}"
+    },
+    "operations": [
+      {
+        "op": "maxCount",
+        "eventName": "page"
+      },
+      {
+        "op": "charge",
+        "eventName": "page",
+        "count": 1000
+      },
+      {
+        "op": "pushDataLimit",
+        "itemsCount": 7,
+        "eventName": "page",
+        "isDefaultDataset": false
+      }
+    ],
+    "expected": [
+      null,
+      {
+        "eventChargeLimitReached": false,
+        "chargedCount": 1000,
+        "chargeableWithinLimit": {
+          "page": null
+        }
+      },
+      7
+    ]
+  },
+  {
+    "name": "local test pay-per-event: every event costs 1",
+    "env": {
+      "ACTOR_TEST_PAY_PER_EVENT": "1",
+      "ACTOR_MAX_TOTAL_CHARGE_USD": "3"
+    },
+    "operations": [
+      {
+        "op": "maxCount",
+        "eventName": "anything"
+      },
+      {
+        "op": "pushDataLimit",
+        "itemsCount": 5,
+        "eventName": "page",
+        "isDefaultDataset": true
+      },
+      {
+        "op": "charge",
+        "eventName": "page",
+        "count": 2
+      },
+      {
+        "op": "charge",
+        "eventName": "page",
+        "count": 2
+      },
+      {
+        "op": "charge",
+        "eventName": "page",
+        "count": 1
+      }
+    ],
+    "expected": [
+      3,
+      1,
+      {
+        "eventChargeLimitReached": false,
+        "chargedCount": 2,
+        "chargeableWithinLimit": {}
+      },
+      {
+        "eventChargeLimitReached": true,
+        "chargedCount": 2,
+        "chargeableWithinLimit": {}
+      },
+      {
+        "eventChargeLimitReached": true,
+        "chargedCount": 0,
+        "chargeableWithinLimit": {}
+      }
+    ]
+  },
+  {
+    "name": "not pay-per-event",
+    "env": {
+      "APIFY_IS_AT_HOME": "1",
+      "ACTOR_RUN_ID": "run",
+      "APIFY_ACTOR_PRICING_INFO": "{\"pricingModel\":\"FREE\"}",
+      "APIFY_CHARGED_ACTOR_EVENT_COUNTS": "{}"
+    },
+    "operations": [
+      {
+        "op": "charge",
+        "eventName": "page",
+        "count": 3
+      },
+      {
+        "op": "pushDataLimit",
+        "itemsCount": 5,
+        "isDefaultDataset": true
+      }
+    ],
+    "expected": [
+      {
+        "eventChargeLimitReached": false,
+        "chargedCount": 0,
+        "chargeableWithinLimit": {}
+      },
+      5
+    ]
+  }
+]

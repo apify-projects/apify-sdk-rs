@@ -1,0 +1,87 @@
+[
+  {
+    "purl": "http://www.example.com/pages/[(\\w|-)*]",
+    "matches": [
+      [
+        "http://www.example.com/pages/",
+        true
+      ],
+      [
+        "http://www.example.com/pages/my-page",
+        true
+      ],
+      [
+        "HTTP://WWW.EXAMPLE.COM/PAGES/X",
+        true
+      ],
+      [
+        "http://www.example.com/pages/a/b",
+        false
+      ],
+      [
+        "http://wwwXexample.com/pages/",
+        false
+      ]
+    ]
+  },
+  {
+    "purl": "http://www.example.com/search?do[\\x5B]load[\\x5D]=1",
+    "matches": [
+      [
+        "http://www.example.com/search?do[load]=1",
+        true
+      ],
+      [
+        "http://www.example.com/search?doXloadX=1",
+        false
+      ]
+    ]
+  },
+  {
+    "purl": "https://shop.dev/product/[\\d+]",
+    "matches": [
+      [
+        "https://shop.dev/product/42",
+        true
+      ],
+      [
+        "https://shop.dev/product/42/",
+        false
+      ],
+      [
+        "https://shop.dev/product/",
+        false
+      ]
+    ]
+  },
+  {
+    "purl": "https://a.dev/[.*]/detail?id=[[0-9]+]",
+    "matches": [
+      [
+        "https://a.dev/x/y/detail?id=17",
+        true
+      ],
+      [
+        "https://a.dev//detail?id=",
+        false
+      ],
+      [
+        "https://a.dev/x/detail?id=a",
+        false
+      ]
+    ]
+  },
+  {
+    "purl": "  https://trim.dev/  ",
+    "matches": [
+      [
+        "https://trim.dev/",
+        true
+      ],
+      [
+        " https://trim.dev/",
+        false
+      ]
+    ]
+  }
+]

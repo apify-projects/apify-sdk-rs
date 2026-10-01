@@ -224,6 +224,11 @@ impl ProxyConfiguration {
         self.new_proxy_info("").map(|info| info.url)
     }
 
+    /// The Apify Proxy URL of the proxy session `session_id`; `None` for custom proxies.
+    pub fn url_for_session(&self, session_id: &str) -> Option<Url> {
+        matches!(self.kind, Kind::Apify { .. }).then(|| self.apify_url(session_id))
+    }
+
     fn apify_url(&self, session_id: &str) -> Url {
         let Kind::Apify { password, .. } = &self.kind else { unreachable!("an Apify Proxy configuration") };
         let mut url = Url::parse(&format!("http://{}:{}", self.hostname, self.port)).expect("a valid proxy URL");

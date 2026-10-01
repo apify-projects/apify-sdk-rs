@@ -1,0 +1,57 @@
+[
+  {
+    "schema": {
+      "properties": {
+        "a": {
+          "type": "integer",
+          "default": 1
+        },
+        "b": {
+          "type": "string"
+        },
+        "c": {
+          "type": "object",
+          "default": {
+            "x": 1
+          }
+        }
+      }
+    },
+    "input": {
+      "b": "given",
+      "c": {
+        "y": 2
+      }
+    },
+    "expected": {
+      "a": 1,
+      "c": {
+        "y": 2
+      },
+      "b": "given"
+    }
+  },
+  {
+    "schema": {
+      "properties": {
+        "list": {
+          "type": "array",
+          "default": []
+        },
+        "flag": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "input": {
+      "flag": true,
+      "extra": 1
+    },
+    "expected": {
+      "list": [],
+      "flag": true,
+      "extra": 1
+    }
+  }
+]

@@ -1,0 +1,47 @@
+[
+  {
+    "options": {},
+    "sessionId": "abc_123",
+    "expected": "http://session-abc_123:env-password@proxy.apify.com:8000"
+  },
+  {
+    "options": {
+      "groups": [
+        "RESIDENTIAL"
+      ]
+    },
+    "sessionId": "abc_123",
+    "expected": "http://groups-RESIDENTIAL,session-abc_123:env-password@proxy.apify.com:8000"
+  },
+  {
+    "options": {
+      "groups": [
+        "RESIDENTIAL",
+        "GOOGLE_SERP"
+      ],
+      "countryCode": "US"
+    },
+    "sessionId": "abc_123",
+    "expected": "http://groups-RESIDENTIAL+GOOGLE_SERP,session-abc_123,country-US:env-password@proxy.apify.com:8000"
+  },
+  {
+    "options": {
+      "apifyProxyGroups": [
+        "A_B"
+      ],
+      "apifyProxyCountry": "CZ",
+      "apifyProxySubdivision": "PR"
+    },
+    "sessionId": "abc_123",
+    "expected": "http://groups-A_B,session-abc_123,country-CZ_PR:env-password@proxy.apify.com:8000"
+  },
+  {
+    "options": {
+      "countryCode": "US",
+      "subdivisionCode": "CA",
+      "password": "p@ss:w/rd"
+    },
+    "sessionId": "abc_123",
+    "expected": "http://session-abc_123,country-US_CA:p%40ss%3Aw%2Frd@proxy.apify.com:8000"
+  }
+]

@@ -1,0 +1,44 @@
+[
+  {
+    "value": "{\"a\":1}",
+    "contentType": "application/json; charset=utf-8",
+    "expected": {
+      "value": {
+        "a": 1
+      }
+    }
+  },
+  {
+    "value": "{\"a\":1}",
+    "contentType": "application/octet-stream",
+    "expected": {
+      "value": {
+        "a": 1
+      }
+    }
+  },
+  {
+    "value": "not json",
+    "contentType": "application/octet-stream",
+    "expected": {
+      "binary": "not json"
+    }
+  },
+  {
+    "value": "hello",
+    "contentType": "text/plain",
+    "expected": {
+      "value": "hello"
+    }
+  },
+  {
+    "value": "[1,2]",
+    "contentType": "APPLICATION/JSON",
+    "expected": {
+      "value": [
+        1,
+        2
+      ]
+    }
+  }
+]

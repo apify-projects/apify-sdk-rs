@@ -44,3 +44,20 @@ jobs:
       - run: >-
           cargo clippy --manifest-path templates/actor/Cargo.toml
           --config 'patch."https://github.com/apify-projects/apify-sdk-rs".apify.path="."'
+
+  # The golden files still match what the JS SDK (at the pinned commit) does.
+  conformance:
+    runs-on: ubuntu-latest
+    env:
+      APIFY_SDK_JS_REV: a57cfb86429368561a9db2787cc647c808450ae0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: |
+          git clone https://github.com/apify/apify-sdk-js ../apify-sdk-js
+          cd ../apify-sdk-js && git checkout "$APIFY_SDK_JS_REV"
+          corepack enable && pnpm install --frozen-lockfile --ignore-scripts && pnpm compile
+      - run: APIFY_SDK_JS_DIR=../apify-sdk-js node --no-warnings conformance/oracle/generate-golden.mts
+      - run: git diff --exit-code conformance/golden

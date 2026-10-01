@@ -175,6 +175,29 @@ mod tests {
         assert_eq!(err.to_string(), "The input in test is not valid JSON.");
     }
 
+    #[test]
+    fn input_values_and_schema_defaults_golden() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!("../conformance/golden/input_values.json")).unwrap();
+        for case in cases {
+            let value = Bytes::from(case["value"].as_str().unwrap().to_owned());
+            let parsed = parse_input(value, case["contentType"].as_str(), "test").unwrap();
+            let expected = &case["expected"];
+            match parsed {
+                Input::Binary(bytes) => {
+                    assert_eq!(expected["binary"], String::from_utf8_lossy(&bytes).as_ref(), "{case}")
+                }
+                Input::Text(text) => assert_eq!(expected["value"], text, "{case}"),
+                Input::Json(json) => assert_eq!(expected["value"], json, "{case}"),
+            }
+        }
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../conformance/golden/schema_defaults.json")).unwrap();
+        for case in cases {
+            let merged = apply_defaults(case["input"].as_object().unwrap().clone(), &case["schema"]);
+            assert_eq!(Value::Object(merged), case["expected"], "{case}");
+        }
+    }
+
     #[tokio::test]
     async fn input_files_in_the_working_directory() {
         let dir = tempfile::tempdir().unwrap();
