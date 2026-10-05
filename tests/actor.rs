@@ -229,6 +229,31 @@ async fn pay_per_event_charges_stay_within_the_budget() {
 }
 
 #[tokio::test]
+async fn concurrent_pay_per_event_pushes_do_not_wait_for_each_other() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "page": { "eventTitle": "Page", "eventPriceUsd": 1.0 },
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "30".to_owned()));
+    assert_exit(&run_child("ppe-concurrent", &vars, dir.path()).await, 0);
+
+    // 30 USD buy 20 items at 1.5, and one more is charged, so that the platform stops the run.
+    assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 21);
+    let pages: u64 = api
+        .platform_calls()
+        .into_iter()
+        .filter(|(path, _, _)| path.ends_with("/charge"))
+        .map(|(_, _, body)| body["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(pages, 21, "each stored item is charged once");
+}
+
+#[tokio::test]
 async fn local_pay_per_event_runs_log_their_charges() {
     let dir = tempfile::tempdir().unwrap();
     let vars = [
@@ -340,6 +365,25 @@ fn child() {
                     let result = actor.push_data_and_charge(&items[..3], "page").await?;
                     assert_eq!(result.charged_count, 0);
                     assert!(actor.push_data_and_charge(&items[0], "apify-default-dataset-item").await.is_err());
+                    Ok(())
+                })
+                .await
+            }
+            "ppe-concurrent" => {
+                apify::main(|actor| async move {
+                    let started = std::time::Instant::now();
+                    let pushes = (0..30).map(|n| {
+                        let actor = actor.clone();
+                        tokio::spawn(async move { actor.push_data_and_charge(&json!({ "n": n }), "page").await })
+                    });
+                    let mut stored = 0;
+                    for push in pushes.collect::<Vec<_>>() {
+                        stored += push.await.unwrap()?.charged_count;
+                    }
+                    assert_eq!(stored, 21);
+                    // Each charge call takes 300 ms: one after another, 21 would take over 6 s.
+                    let elapsed = started.elapsed();
+                    assert!(elapsed < Duration::from_secs(2), "the pushes waited for each other: {elapsed:?}");
                     Ok(())
                 })
                 .await

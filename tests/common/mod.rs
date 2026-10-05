@@ -662,6 +662,10 @@ async fn run_action(
     body: Bytes,
 ) -> Response {
     record_platform_call(&shared, uri.path().to_owned(), query, &body);
+    if uri.path().ends_with("/charge") {
+        // As slow as a real API call, so that charges waiting for each other show.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
     envelope(StatusCode::OK, json!({ "id": "run", "status": "ABORTING" }))
 }
 
