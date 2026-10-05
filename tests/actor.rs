@@ -86,6 +86,27 @@ async fn a_failing_user_function_exits_with_91() {
     assert_eq!(terminal_messages(&api), ["Done"]);
 }
 
+/// `Actor::init` and `exit` without `apify::main`, with the Actor reached through `apify::actor()`.
+#[tokio::test]
+async fn the_initialized_actor_is_reachable_from_anywhere() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "INPUT", br#"{"greeting":"hi"}"#, "application/json; charset=utf-8");
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = run_child("global", &platform_env(&api, None), dir.path()).await;
+    assert_exit(&output, 0);
+    assert_eq!(api.dataset_items(DEFAULT_DATASET), [json!({ "echo": { "greeting": "hi" } })]);
+    assert_eq!(terminal_messages(&api), ["Echoed"]);
+}
+
+#[tokio::test]
+async fn the_actor_is_not_reachable_before_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("global-before-init", &[], dir.path()).await;
+    assert_exit(&output, 101);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("apify::actor() was called before Actor::init()"));
+}
+
 #[tokio::test]
 async fn an_aborted_run_exits_gracefully_after_saving_its_state() {
     let api = FakeApi::start().await;
@@ -395,6 +416,19 @@ fn child() {
                     Ok(())
                 })
                 .await
+            }
+            "global" => {
+                async fn echo() -> anyhow::Result<()> {
+                    let input: Value = apify::actor().get_input().await?;
+                    apify::actor().push_data(&json!({ "echo": input })).await?;
+                    Ok(())
+                }
+                apify::Actor::init(apify::InitOptions::default()).await.unwrap();
+                echo().await.unwrap();
+                apify::actor().exit(apify::ExitOptions::message("Echoed")).await;
+            }
+            "global-before-init" => {
+                apify::actor();
             }
             "late-init" => {
                 crawlee::Services::global();

@@ -73,7 +73,7 @@ These are direct mappings: the client already has the endpoint, or crawlee-rs al
 4. **Platform storage hooks.** Possibly a `StorageBackend::stats()` extension. crawlee-rs's `purge_on_start` semantics already fit: on the platform the cloud backend's purge is a no-op, as in JS.
 
 **Deliberate API differences from JS, to agree on:**
-- **Entry point.** JS has a static singleton (`Actor.pushData`). I'd make `Actor` a cheap cloneable handle returned by `Actor::init()` and passed into the closure in `apify::main(|actor| async move { … })`, plus `Actor::current()` for code that can't receive it. A `#[apify::main]` macro could come later.
+- **Entry point.** JS has a static singleton (`Actor.pushData`). I'd make `Actor` a cheap cloneable handle returned by `Actor::init()` and passed into the closure in `apify::main(|actor| async move { … })`, plus `Actor::current()` for code that can't receive it. Since then: `apify::actor()` returns the initialized Actor from anywhere, as the static `Actor` of JS, and is what the template uses. A `#[apify::main]` macro could come later.
 - **JS bugs to fix, not copy:**
   - "At home" is read two ways (the env var in some places, the configuration in others). Make it one.
   - `abort({statusMessage})` sets the message on the current run instead of the aborted one.

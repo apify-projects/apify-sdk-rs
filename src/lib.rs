@@ -16,7 +16,7 @@ pub mod storage;
 pub mod url_filters;
 
 pub use crate::actor::{
-    Actor, ExitOptions, InitError, InitOptions, OpenOptions, StatusMessageOptions, exit_codes, main, main_with,
+    Actor, ExitOptions, InitError, InitOptions, OpenOptions, StatusMessageOptions, actor, exit_codes, main, main_with,
 };
 pub use crate::client::{RateLimitCounter, new_client};
 pub use crate::configuration::Configuration;

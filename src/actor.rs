@@ -129,8 +129,8 @@ struct Inner {
 ///
 /// [`Actor::init`] creates it and installs its [`Services`] as the process-wide crawlee-rs
 /// services, so crawlers built afterwards store their data where the Actor does: in the
-/// platform storages on the platform, in `./storage` elsewhere. [`Actor::current`] returns it
-/// from anywhere, like the static `Actor` of the JS SDK.
+/// platform storages on the platform, in `./storage` elsewhere. [`actor()`] returns it from
+/// anywhere, like the static `Actor` of the JS SDK.
 #[derive(Clone)]
 pub struct Actor {
     inner: Arc<Inner>,
@@ -200,6 +200,25 @@ where
             actor.exit(ExitOptions { exit_code: exit_codes::ERROR_USER_FUNCTION_THREW, ..exit }).await;
         }
     }
+}
+
+/// The Actor of this process, like the static `Actor` of the JS SDK. [`Actor::current`] when it
+/// may not be initialized.
+///
+/// ```no_run
+/// # async fn run() -> anyhow::Result<()> {
+/// apify::Actor::init(Default::default()).await?;
+/// apify::actor().push_data(&serde_json::json!({ "hello": "world" })).await?;
+/// apify::actor().exit(Default::default()).await;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Panics
+///
+/// When [`Actor::init`] has not been called.
+pub fn actor() -> &'static Actor {
+    CURRENT.get().expect("apify::actor() was called before Actor::init()")
 }
 
 fn flush_and_exit(code: i32) -> ! {
