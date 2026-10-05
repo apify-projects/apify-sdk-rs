@@ -237,7 +237,16 @@ async fn gate(State(shared): State<Shared>, request: Request, next: Next) -> Res
     if !authorized {
         return error(StatusCode::UNAUTHORIZED, "token-not-provided");
     }
-    let limited = shared.rate_limited.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+    // Takes one of the remaining rate-limited answers, if any. Not `fetch_update`, deprecated in
+    // newer Rust, nor `try_update`, newer than the MSRV.
+    let mut remaining = shared.rate_limited.load(Ordering::SeqCst);
+    let limited = loop {
+        let Some(next) = remaining.checked_sub(1) else { break false };
+        match shared.rate_limited.compare_exchange(remaining, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break true,
+            Err(current) => remaining = current,
+        }
+    };
     if limited {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate-limit-exceeded");
     }
