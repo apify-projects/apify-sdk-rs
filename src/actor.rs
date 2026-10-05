@@ -547,20 +547,7 @@ impl Actor {
     /// pay-per-event pricing, only as many items are stored as the budget allows, each charged as
     /// an `apify-default-dataset-item` event.
     pub async fn push_data<T: serde::Serialize + ?Sized>(&self, data: &T) -> Result<ChargeResult, ChargingError> {
-        let dataset = self.inner.services.open_dataset(&StorageIdentifier::Default).await?;
-        let charging = &self.inner.charging;
-        charging
-            .with_charge_lock(async {
-                // The dataset charges the per-item event for what it stores.
-                let before = charging.charged_event_count(DEFAULT_DATASET_ITEM_EVENT);
-                dataset.push_data(data).await?;
-                Ok(ChargeResult {
-                    event_charge_limit_reached: charging.is_event_charge_limit_reached(DEFAULT_DATASET_ITEM_EVENT),
-                    charged_count: charging.charged_event_count(DEFAULT_DATASET_ITEM_EVENT) - before,
-                    chargeable_within_limit: charging.chargeable_within_limit(),
-                })
-            })
-            .await
+        self.push_items_charging(data, &[]).await
     }
 
     /// Pushes items to the default dataset and charges `event_name` for each, as many as the
@@ -570,31 +557,77 @@ impl Actor {
         data: &T,
         event_name: &str,
     ) -> Result<ChargeResult, ChargingError> {
-        if event_name.starts_with("apify-") {
-            return Err(ChargingError::SyntheticEvent(event_name.to_owned()));
+        self.push_data_and_charge_events(data, &[event_name]).await
+    }
+
+    /// Pushes items to the default dataset and charges each of `events` for each item, as many
+    /// items as the budget allows for all of them. `event_charge_limit_reached` is set when the
+    /// budget allows no more of one of the events.
+    pub async fn push_data_and_charge_events<T: serde::Serialize + ?Sized>(
+        &self,
+        data: &T,
+        events: &[&str],
+    ) -> Result<ChargeResult, ChargingError> {
+        if let Some(event) = events.iter().find(|event| event.starts_with("apify-")) {
+            return Err(ChargingError::SyntheticEvent((*event).to_owned()));
         }
+        self.push_items_charging(data, events).await
+    }
+
+    /// Stores as many items as the budget allows for `events` (plus the default dataset item
+    /// event), reserving their charges first and sending them after, so that concurrent pushes
+    /// neither wait for each other nor spend more than the budget together.
+    async fn push_items_charging<T: serde::Serialize + ?Sized>(
+        &self,
+        data: &T,
+        events: &[&str],
+    ) -> Result<ChargeResult, ChargingError> {
         let mut items = match serde_json::to_value(data)? {
             Value::Array(items) => items,
             item => vec![item],
         };
         let dataset = self.inner.services.open_dataset(&StorageIdentifier::Default).await?;
         let charging = &self.inner.charging;
-        charging
-            .with_charge_lock(async {
-                // Storing an item also charges the per-item event when the dataset is the Actor's own.
-                let limit = charging.push_data_limit(items.len(), Some(event_name), self.inner.smart.is_some());
-                if limit == 0 {
-                    return Ok(ChargeResult {
-                        event_charge_limit_reached: !items.is_empty(),
-                        charged_count: 0,
-                        chargeable_within_limit: charging.chargeable_within_limit(),
-                    });
-                }
-                items.truncate(limit);
-                dataset.push_data(&items).await?;
-                charging.charge(ChargeOptions::new(event_name, limit as u64)).await
-            })
-            .await
+        if !charging.is_pay_per_event() {
+            dataset.push_data(&items).await?;
+            // Warns that the Actor is not pay-per-event.
+            let mut result = None;
+            for event in events {
+                result = Some(charging.charge(ChargeOptions::new(*event, items.len() as u64)).await?);
+            }
+            return Ok(result.unwrap_or_else(|| ChargeResult {
+                event_charge_limit_reached: false,
+                charged_count: 0,
+                chargeable_within_limit: charging.chargeable_within_limit(),
+            }));
+        }
+        // Storing an item also charges the per-item event when the dataset is the Actor's own.
+        let is_default_dataset = self.inner.smart.is_some();
+        let limit = charging.reserve_items(items.len(), events, is_default_dataset);
+        if limit == 0 {
+            return Ok(ChargeResult {
+                event_charge_limit_reached: !items.is_empty(),
+                charged_count: 0,
+                chargeable_within_limit: charging.chargeable_within_limit(),
+            });
+        }
+        items.truncate(limit);
+        if let Err(err) = ChargingManager::with_items_reserved(dataset.push_data(&items)).await {
+            charging.unreserve_items(events, is_default_dataset, limit);
+            return Err(err.into());
+        }
+        charging.send_item_charges(events, is_default_dataset, limit).await?;
+        let reached = if events.is_empty() {
+            charging.is_event_charge_limit_reached(DEFAULT_DATASET_ITEM_EVENT)
+        } else {
+            events.iter().any(|event| charging.is_event_charge_limit_reached(event))
+        };
+        Ok(ChargeResult {
+            event_charge_limit_reached: reached,
+            // Without the default dataset item event, `push_data` charges nothing.
+            charged_count: if events.is_empty() && !is_default_dataset { 0 } else { limit as u64 },
+            chargeable_within_limit: charging.chargeable_within_limit(),
+        })
     }
 
     /// A value of the default key-value store.

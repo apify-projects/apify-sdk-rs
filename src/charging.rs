@@ -3,6 +3,10 @@
 //!
 //! Items pushed to the default dataset are charged as the synthetic `apify-default-dataset-item`
 //! event, by the storage backend at the moment they are stored.
+//!
+//! A charge is counted against the budget at once, in one short critical section, and then sent
+//! to the platform without holding anything: concurrent charges and pushes do not wait for each
+//! other's API calls, and cannot together spend more than the budget.
 
 use std::sync::Arc;
 
@@ -135,8 +139,9 @@ fn limit(count: f64) -> Option<u64> {
 }
 
 tokio::task_local! {
-    /// Set inside [`ChargingManager::with_charge_lock`], which is re-entrant within a task.
-    static CHARGE_LOCK_HELD: ();
+    /// Set while the Actor stores items whose charges it already reserved, so that the default
+    /// dataset does not reserve them again.
+    static ITEMS_RESERVED: ();
 }
 
 /// Tracks the charges of a run and makes them.
@@ -144,7 +149,6 @@ pub struct ChargingManager {
     configuration: Arc<Configuration>,
     client: ApifyClient,
     state: Mutex<State>,
-    lock: tokio::sync::Mutex<()>,
     log_dataset: tokio::sync::OnceCell<Dataset>,
 }
 
@@ -161,7 +165,6 @@ impl ChargingManager {
             configuration,
             client,
             state: Mutex::new(State { max_total_charge_usd, ..State::default() }),
-            lock: tokio::sync::Mutex::new(()),
             log_dataset: tokio::sync::OnceCell::new(),
         }
     }
@@ -283,16 +286,6 @@ impl ChargingManager {
         self.state.lock().charged.get(event_name).map_or(0, |(count, _)| *count)
     }
 
-    /// Runs `f` holding the charge lock (when pay-per-event), so that a reservation and the charge
-    /// acting on it are not interleaved with other charges. Re-entrant within a task.
-    pub async fn with_charge_lock<F: Future>(&self, f: F) -> F::Output {
-        if !self.is_pay_per_event() || CHARGE_LOCK_HELD.try_with(|_| ()).is_ok() {
-            return f.await;
-        }
-        let _guard = self.lock.lock().await;
-        CHARGE_LOCK_HELD.scope((), f).await
-    }
-
     /// Charges for `count` events, as far as the budget allows. When it allows fewer, one more is
     /// charged, so that the platform notices and stops the run.
     pub async fn charge(&self, options: ChargeOptions) -> Result<ChargeResult, ChargingError> {
@@ -313,53 +306,139 @@ impl ChargingManager {
         if !self.is_initialized() {
             return Err(ChargingError::NotInitialized);
         }
-        self.with_charge_lock(self.charge_locked(options)).await
+        let ChargeOptions { event_name, count, idempotency_key } = options;
+        let charged_count = self.reserve(&event_name, count);
+        if charged_count > 0 {
+            self.send_charge(&event_name, charged_count, idempotency_key).await?;
+        }
+        if charged_count < count && charged_count > 0 {
+            let subject = if count == 1 { "instance" } else { "instances" };
+            tracing::info!(
+                "Charging {count} {subject} of '{event_name}' event would exceed maxTotalChargeUsd - only \
+                 {charged_count} events were charged"
+            );
+        }
+        let state = self.state.lock();
+        Ok(ChargeResult {
+            event_charge_limit_reached: if charged_count == 0 {
+                count > 0
+            } else {
+                self.is_event_charge_limit_reached_of(&state, &event_name)
+            },
+            charged_count,
+            chargeable_within_limit: self.chargeable_within_limit_of(&state),
+        })
     }
 
-    async fn charge_locked(&self, options: ChargeOptions) -> Result<ChargeResult, ChargingError> {
-        let ChargeOptions { event_name, count, idempotency_key } = options;
-        let is_at_home = self.configuration.is_at_home;
-        let (charged_count, pricing) = {
-            let mut state = self.state.lock();
-            let max = self.max_event_charge_count_of(&state, &event_name);
-            let charged_count = if (count as f64) <= max {
-                count
-            } else if self.total_charged_amount_of(&state) <= state.max_total_charge_usd {
-                // Over budget: one more than allowed, so that the platform stops the run. Not when
-                // already strictly over it.
-                max as u64 + 1
-            } else {
-                0
-            };
-            if charged_count == 0 {
-                return Ok(ChargeResult {
-                    event_charge_limit_reached: count > 0,
-                    charged_count: 0,
-                    chargeable_within_limit: self.chargeable_within_limit_of(&state),
-                });
-            }
-            // Unknown events cost 1 locally, so that the budget can be reached in development.
-            let pricing = state.prices.get(&event_name).cloned().unwrap_or_else(|| EventPrice {
-                price: if is_at_home { 0.0 } else { 1.0 },
-                title: format!("Unknown event '{event_name}'"),
-            });
-            let entry = state.charged.entry(event_name.clone()).or_insert((0, 0.0));
-            entry.0 += charged_count;
-            entry.1 += charged_count as f64 * pricing.price;
-            (charged_count, pricing)
+    /// Counts up to `count` events as charged, as far as the budget allows (one more when it
+    /// allows fewer, unless already over it), and returns how many.
+    fn reserve(&self, event_name: &str, count: u64) -> u64 {
+        let mut state = self.state.lock();
+        let max = self.max_event_charge_count_of(&state, event_name);
+        let charged_count = if (count as f64) <= max {
+            count
+        } else if self.total_charged_amount_of(&state) <= state.max_total_charge_usd {
+            // Over budget: one more than allowed, so that the platform stops the run. Not when
+            // already strictly over it.
+            max as u64 + 1
+        } else {
+            0
         };
+        self.add_charged(&mut state, event_name, charged_count as i64);
+        charged_count
+    }
 
-        if is_at_home {
-            let known = self.state.lock().prices.contains_key(&event_name);
+    /// Adds `count` (or takes it back, when negative) to what was charged for `event_name`.
+    fn add_charged(&self, state: &mut State, event_name: &str, count: i64) {
+        if count == 0 {
+            return;
+        }
+        // Unknown events cost 1 locally, so that the budget can be reached in development.
+        let price =
+            state.prices.get(event_name).map_or(if self.configuration.is_at_home { 0.0 } else { 1.0 }, |p| p.price);
+        let entry = state.charged.entry(event_name.to_owned()).or_insert((0, 0.0));
+        entry.0 = entry.0.saturating_add_signed(count);
+        entry.1 += count as f64 * price;
+    }
+
+    /// Reserves the charges of as many of `items_count` items as the budget allows, each charged
+    /// one of every event of `events`, plus the default dataset item event if
+    /// `is_default_dataset`. Returns how many items to store. All the charges are counted at
+    /// once, so that concurrent pushes cannot together spend more than the budget.
+    pub(crate) fn reserve_items(&self, items_count: usize, events: &[&str], is_default_dataset: bool) -> usize {
+        let mut state = self.state.lock();
+        let limit = self.push_data_limit_of(&state, items_count, events, is_default_dataset);
+        if state.pricing_model.as_deref() == Some(PAY_PER_EVENT) {
+            for event in Self::item_events(events, is_default_dataset) {
+                self.add_charged(&mut state, event, limit as i64);
+            }
+        }
+        limit
+    }
+
+    /// Takes back a reservation of [`reserve_items`](Self::reserve_items) for items that were
+    /// not stored.
+    pub(crate) fn unreserve_items(&self, events: &[&str], is_default_dataset: bool, items_count: usize) {
+        let mut state = self.state.lock();
+        if state.pricing_model.as_deref() == Some(PAY_PER_EVENT) {
+            for event in Self::item_events(events, is_default_dataset) {
+                self.add_charged(&mut state, event, -(items_count as i64));
+            }
+        }
+    }
+
+    /// Sends the charges reserved by [`reserve_items`](Self::reserve_items).
+    pub(crate) async fn send_item_charges(
+        &self,
+        events: &[&str],
+        is_default_dataset: bool,
+        items_count: usize,
+    ) -> Result<(), ChargingError> {
+        if !self.is_pay_per_event() || items_count == 0 {
+            return Ok(());
+        }
+        for event in Self::item_events(events, is_default_dataset) {
+            self.send_charge(event, items_count as u64, None).await?;
+        }
+        Ok(())
+    }
+
+    fn item_events<'a>(events: &'a [&'a str], is_default_dataset: bool) -> impl Iterator<Item = &'a str> {
+        events.iter().copied().chain(is_default_dataset.then_some(DEFAULT_DATASET_ITEM_EVENT))
+    }
+
+    /// Stores items with `store`, whose charges were reserved already: the default dataset does
+    /// not charge them again.
+    pub(crate) async fn with_items_reserved<F: Future>(store: F) -> F::Output {
+        ITEMS_RESERVED.scope((), store).await
+    }
+
+    /// Sends a charge counted already: to the platform (unless synthetic, charged by the platform
+    /// itself), and to the local charging log.
+    async fn send_charge(
+        &self,
+        event_name: &str,
+        count: u64,
+        idempotency_key: Option<String>,
+    ) -> Result<(), ChargingError> {
+        let (known, title, price) = {
+            let state = self.state.lock();
+            match state.prices.get(event_name) {
+                Some(pricing) => (true, pricing.title.clone(), pricing.price),
+                None => (
+                    false,
+                    format!("Unknown event '{event_name}'"),
+                    if self.configuration.is_at_home { 0.0 } else { 1.0 },
+                ),
+            }
+        };
+        if self.configuration.is_at_home {
             if event_name.starts_with("apify-") {
                 // Synthetic events are charged by the platform itself, from the dataset writes.
             } else if known {
                 let run_id = self.configuration.actor_run_id.clone().unwrap_or_default();
-                let charge = RunChargeOptions {
-                    event_name: event_name.clone(),
-                    count: Some(charged_count as i64),
-                    idempotency_key,
-                };
+                let charge =
+                    RunChargeOptions { event_name: event_name.to_owned(), count: Some(count as i64), idempotency_key };
                 self.client.run(run_id).charge(charge).await?;
             } else {
                 tracing::warn!("Attempting to charge for an unknown event '{event_name}'");
@@ -369,26 +448,14 @@ impl ChargingManager {
             dataset
                 .push_data(&serde_json::json!({
                     "eventName": event_name,
-                    "eventTitle": pricing.title,
-                    "eventPriceUsd": pricing.price,
-                    "chargedCount": charged_count,
+                    "eventTitle": title,
+                    "eventPriceUsd": price,
+                    "chargedCount": count,
                     "timestamp": crawlee::core::now_iso(),
                 }))
                 .await?;
         }
-        if charged_count < count {
-            let subject = if count == 1 { "instance" } else { "instances" };
-            tracing::info!(
-                "Charging {count} {subject} of '{event_name}' event would exceed maxTotalChargeUsd - only \
-                 {charged_count} events were charged"
-            );
-        }
-        let state = self.state.lock();
-        Ok(ChargeResult {
-            event_charge_limit_reached: self.is_event_charge_limit_reached_of(&state, &event_name),
-            charged_count,
-            chargeable_within_limit: self.chargeable_within_limit_of(&state),
-        })
+        Ok(())
     }
 
     fn total_charged_amount_of(&self, state: &State) -> f64 {
@@ -438,27 +505,34 @@ impl ChargingManager {
     /// How many of `items_count` items can be pushed within the budget, each charged as
     /// `event_name` (if set) plus the default dataset item event (if `is_default_dataset`).
     pub fn push_data_limit(&self, items_count: usize, event_name: Option<&str>, is_default_dataset: bool) -> usize {
-        let state = self.state.lock();
+        let events: Vec<&str> = event_name.into_iter().collect();
+        self.push_data_limit_of(&self.state.lock(), items_count, &events, is_default_dataset)
+    }
+
+    fn push_data_limit_of(
+        &self,
+        state: &State,
+        items_count: usize,
+        events: &[&str],
+        is_default_dataset: bool,
+    ) -> usize {
         if state.pricing_model.as_deref() != Some(PAY_PER_EVENT) || items_count == 0 {
             return items_count;
         }
-        let item_price = event_name.map_or(0.0, |name| self.event_price_of(&state, name).unwrap_or(0.0))
-            + if is_default_dataset {
-                self.event_price_of(&state, DEFAULT_DATASET_ITEM_EVENT).unwrap_or(0.0)
-            } else {
-                0.0
-            };
+        let item_price: f64 = Self::item_events(events, is_default_dataset)
+            .map(|event| self.event_price_of(state, event).unwrap_or(0.0))
+            .sum();
         if item_price == 0.0 {
             return items_count;
         }
-        let max = self.max_charges_by_price_of(&state, item_price);
+        let max = self.max_charges_by_price_of(state, item_price);
         if max >= items_count as f64 {
             return items_count;
         }
         if max > 0.0 {
             return max as usize;
         }
-        usize::from(self.total_charged_amount_of(&state) <= state.max_total_charge_usd)
+        usize::from(self.total_charged_amount_of(state) <= state.max_total_charge_usd)
     }
 }
 
@@ -484,25 +558,25 @@ impl DatasetBackend for ChargingDataset {
 
     async fn push_data(&self, mut items: Vec<DatasetItem>) -> StorageResult<()> {
         let charging = &self.charging;
-        // Datasets also work before the Actor is initialized, with nothing to charge.
-        if items.is_empty() || !charging.is_initialized() || !charging.is_pay_per_event() {
+        // Datasets also work before the Actor is initialized, with nothing to charge. Items the
+        // Actor reserved the charges of are stored as they are.
+        if items.is_empty()
+            || !charging.is_initialized()
+            || !charging.is_pay_per_event()
+            || ITEMS_RESERVED.try_with(|_| ()).is_ok()
+        {
             return self.inner.push_data(items).await;
         }
-        charging
-            .with_charge_lock(async {
-                let limit = charging.push_data_limit(items.len(), None, true);
-                if limit == 0 {
-                    return Ok(());
-                }
-                items.truncate(limit);
-                self.inner.push_data(items).await?;
-                charging
-                    .charge(ChargeOptions::new(DEFAULT_DATASET_ITEM_EVENT, limit as u64))
-                    .await
-                    .map_err(|err| StorageError::Backend(Box::new(err)))?;
-                Ok(())
-            })
-            .await
+        let limit = charging.reserve_items(items.len(), &[], true);
+        if limit == 0 {
+            return Ok(());
+        }
+        items.truncate(limit);
+        if let Err(err) = self.inner.push_data(items).await {
+            charging.unreserve_items(&[], true, limit);
+            return Err(err);
+        }
+        charging.send_item_charges(&[], true, limit).await.map_err(|err| StorageError::Backend(Box::new(err)))
     }
 
     async fn get_data(&self, options: DatasetListOptions) -> StorageResult<PaginatedList<DatasetItem>> {
@@ -630,11 +704,11 @@ mod tests {
         assert_eq!(manager.push_data_limit(3, Some("page"), true), 3);
 
         // Charges above the budget are cut, plus one to make the platform stop the run.
-        let result = manager.charge_locked(ChargeOptions::new("apify-default-dataset-item", 20)).await.unwrap();
+        let result = manager.charge(ChargeOptions::new("apify-default-dataset-item", 20)).await.unwrap();
         assert_eq!(result.charged_count, 15);
         assert!(result.event_charge_limit_reached);
         assert_eq!(manager.max_event_charge_count_within_limit("page"), Some(0));
-        let result = manager.charge_locked(ChargeOptions::new("apify-default-dataset-item", 1)).await.unwrap();
+        let result = manager.charge(ChargeOptions::new("apify-default-dataset-item", 1)).await.unwrap();
         assert_eq!(result.charged_count, 0, "strictly over the budget: nothing more");
         assert!(result.event_charge_limit_reached);
         assert_eq!(manager.push_data_limit(5, None, true), 0);
