@@ -227,11 +227,17 @@ impl Actor {
         }
 
         let configuration = Arc::new(options.configuration.unwrap_or_else(Configuration::from_env));
+        // How much the runtime runs in parallel: the CPUs Rust sees (cgroup quotas included) and
+        // the tokio worker threads.
+        let runtime = tokio::runtime::Handle::current();
         tracing::info!(
             apify_version = env!("CARGO_PKG_VERSION"),
             apify_client_version = apify_client::CLIENT_VERSION,
             crawlee_version = crawlee::VERSION,
             os = std::env::consts::OS,
+            available_parallelism = std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
+            tokio_flavor = ?runtime.runtime_flavor(),
+            tokio_workers = runtime.metrics().num_workers(),
             "System info"
         );
 
