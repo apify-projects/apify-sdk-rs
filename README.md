@@ -30,24 +30,24 @@ use apify::{Actor, ExitOptions, InitOptions};
 async fn main() -> anyhow::Result<()> {
     Actor::init(InitOptions::default()).await?;
     match run().await {
-        Ok(()) => apify::actor().exit(ExitOptions::default()).await,
+        Ok(()) => Actor::exit(ExitOptions::default()).await,
         Err(err) => {
             tracing::error!("{err:?}");
-            apify::actor().fail(ExitOptions::default()).await;
+            Actor::fail(ExitOptions::default()).await;
         }
     }
     Ok(())
 }
 
 async fn run() -> anyhow::Result<()> {
-    // `apify::actor()` is the Actor of the process, like the static `Actor` of the JS SDK.
-    let input: serde_json::Value = apify::actor().get_input().await?;
+    // `Actor` is the run of this process, like the static `Actor` of the JS SDK.
+    let input: serde_json::Value = Actor::get_input().await?;
     let start = input["startUrl"].as_str().unwrap_or("https://crawlee.dev").to_owned();
 
     // Crawlers store their data where the Actor does: in the platform storages on Apify,
     // in ./storage elsewhere.
     let crawler = HtmlCrawler::builder()
-        .services(apify::actor().services().clone())
+        .services(Actor::services().clone())
         .request_handler(|ctx: HtmlContext| async move {
             let title = ctx.with_html(|doc| doc.title()).await?;
             ctx.push_data(&serde_json::json!({ "url": ctx.url().as_str(), "title": title }))?;
@@ -60,8 +60,8 @@ async fn run() -> anyhow::Result<()> {
 }
 ```
 
-`apify::main(|actor| async move { ... })` does the same in one call, with exit code 91 when the
-function fails.
+`Actor::main(|| async { ... })` does the same in one call, with exit code 91 when the function
+fails.
 
 [`templates/actor`](templates/actor) is a complete Actor: Dockerfile, `.actor/actor.json` and an
 input schema. Copy it and `apify push`.
@@ -70,7 +70,7 @@ input schema. Copy it and `apify push`.
 
 | | |
 |---|---|
-| **Lifecycle** | `Actor::init` / `exit` / `fail` / `reboot`, `apify::actor()` from anywhere, `apify::main`, exit codes (91 when the user function fails), a watchdog for hung exits |
+| **Lifecycle** | `Actor::init` / `exit` / `fail` / `reboot` / `main`, the Actor's functions callable from anywhere after `init` (as the static `Actor` of JS), exit codes (91 when the user function fails), a watchdog for hung exits |
 | **Configuration** | Every `ACTOR_*` / `APIFY_*` variable of the JS SDK, with its precedence and defaults (all memory on the platform) |
 | **Storages** | Platform datasets, key-value stores and request queues behind the crawlee-rs storage traits; names, aliases (`ACTOR_STORAGES_JSON`, remembered across migrations), `force_cloud`; local files with the input kept on purge |
 | **Request queues** | Single-consumer mode (local head estimate, no locks) and shared mode (platform locks, prolonged for long requests) |

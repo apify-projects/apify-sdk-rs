@@ -25,10 +25,10 @@ async fn main() -> anyhow::Result<()> {
 
     Actor::init(InitOptions::default()).await?;
     match run().await {
-        Ok(()) => apify::actor().exit(ExitOptions::default()).await,
+        Ok(()) => Actor::exit(ExitOptions::default()).await,
         Err(err) => {
             tracing::error!("{err:?}");
-            apify::actor().fail(ExitOptions::default()).await;
+            Actor::fail(ExitOptions::default()).await;
         }
     }
     Ok(())
@@ -36,10 +36,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     // Missing fields get their defaults from `.actor/input_schema.json`.
-    let input: Input = apify::actor().get_input().await?;
+    let input: Input = Actor::get_input().await?;
 
     let crawler = HtmlCrawler::builder()
-        .services(apify::actor().services().clone())
+        .services(Actor::services().clone())
         .max_requests_per_crawl(input.max_requests_per_crawl)
         .request_handler(|ctx: HtmlContext| async move {
             let title = ctx.with_html(|doc| doc.title()).await?;

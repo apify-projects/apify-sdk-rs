@@ -167,20 +167,20 @@ impl ApifyEnv {
 
 impl Actor {
     /// The environment of the run.
-    pub fn get_env(&self) -> ApifyEnv {
+    pub fn get_env() -> ApifyEnv {
         ApifyEnv::from_env()
     }
 
-    fn client_for(&self, token: Option<&str>) -> ApifyClient {
+    fn client_for(token: Option<&str>) -> ApifyClient {
         match token {
-            Some(token) => self.new_client(token),
-            None => self.client().clone(),
+            Some(token) => Self::new_client(token),
+            None => Self::client().clone(),
         }
     }
 
     /// What remains of this run's timeout, on the platform.
-    fn remaining_time_secs(&self) -> Option<i64> {
-        let timeout_at = self.get_env().timeout_at.filter(|_| self.is_at_home());
+    fn remaining_time_secs() -> Option<i64> {
+        let timeout_at = Self::get_env().timeout_at.filter(|_| Self::is_at_home());
         let Some(timeout_at) = timeout_at else {
             tracing::warn!(
                 "Using `inherit` argument is only possible when the Actor is running on the Apify platform and when \
@@ -192,11 +192,11 @@ impl Actor {
         Some(((remaining_millis + 999).div_euclid(1000)).max(MINIMUM_API_TIMEOUT_SECS))
     }
 
-    fn start_options(&self, options: &CallOptions) -> ActorStartOptions {
+    fn start_options(options: &CallOptions) -> ActorStartOptions {
         let mut start = options.start.clone();
         match options.timeout {
             Some(RunTimeout::Duration(timeout)) => start.timeout_secs = Some(timeout.as_secs() as i64),
-            Some(RunTimeout::Inherit) => start.timeout_secs = self.remaining_time_secs(),
+            Some(RunTimeout::Inherit) => start.timeout_secs = Self::remaining_time_secs(),
             None => {}
         }
         start
@@ -204,43 +204,40 @@ impl Actor {
 
     /// Starts an Actor (`username/actor-name` or its id) and waits for its run to finish.
     pub async fn call<T: Serialize>(
-        &self,
         actor_id: &str,
         input: Option<&T>,
         options: CallOptions,
     ) -> ApifyClientResult<ActorRun> {
-        let client = self.client_for(options.token.as_deref());
+        let client = Self::client_for(options.token.as_deref());
         let wait = options.wait.map(|wait| wait.as_secs() as i64);
-        client.actor(actor_id).call(input, self.start_options(&options), wait).await
+        client.actor(actor_id).call(input, Self::start_options(&options), wait).await
     }
 
     /// Starts an Actor without waiting for its run to finish.
     pub async fn start<T: Serialize>(
-        &self,
         actor_id: &str,
         input: Option<&T>,
         options: CallOptions,
     ) -> ApifyClientResult<ActorRun> {
-        let client = self.client_for(options.token.as_deref());
-        client.actor(actor_id).start(input, self.start_options(&options)).await
+        let client = Self::client_for(options.token.as_deref());
+        client.actor(actor_id).start(input, Self::start_options(&options)).await
     }
 
     /// Runs a task, with `input` overriding the task's input, and waits for the run to finish.
     pub async fn call_task<T: Serialize>(
-        &self,
         task_id: &str,
         input: Option<&T>,
         options: CallOptions,
     ) -> ApifyClientResult<ActorRun> {
-        let client = self.client_for(options.token.as_deref());
+        let client = Self::client_for(options.token.as_deref());
         let wait = options.wait.map(|wait| wait.as_secs() as i64);
-        client.task(task_id).call(input, self.start_options(&options), wait).await
+        client.task(task_id).call(input, Self::start_options(&options), wait).await
     }
 
     /// Aborts a run. The status message goes to the aborted run (the JS SDK sets it on the
     /// current run).
-    pub async fn abort(&self, run_id: &str, options: AbortOptions) -> ApifyClientResult<ActorRun> {
-        let client = self.client_for(options.token.as_deref());
+    pub async fn abort(run_id: &str, options: AbortOptions) -> ApifyClientResult<ActorRun> {
+        let client = Self::client_for(options.token.as_deref());
         if let Some(message) = &options.status_message {
             let body = serde_json::json!({ "statusMessage": message, "isStatusMessageTerminal": true });
             client.run(run_id).update(&body).await?;
@@ -251,55 +248,53 @@ impl Actor {
     /// Replaces this run's Actor with `target_actor_id`, keeping the run (and its storages). On
     /// the platform the process is then stopped; this waits for it. Does nothing off the platform.
     pub async fn metamorph<T: Serialize>(
-        &self,
         target_actor_id: &str,
         input: Option<&T>,
         options: MetamorphOptions,
     ) -> ApifyClientResult<()> {
-        if !self.is_at_home() {
+        if !Self::is_at_home() {
             tracing::warn!("Actor::metamorph() is only supported when running on the Apify platform.");
             return Ok(());
         }
-        let run_id = self.run_id()?;
+        let run_id = Self::run_id()?;
         let metamorph = apify_client::RunMetamorphOptions { build: options.build, ..Default::default() };
-        self.client().run(run_id).metamorph(target_actor_id, input, metamorph).await?;
-        tokio::time::sleep(options.after_sleep.unwrap_or(self.configuration().metamorph_after_sleep)).await;
+        Self::client().run(run_id).metamorph(target_actor_id, input, metamorph).await?;
+        tokio::time::sleep(options.after_sleep.unwrap_or(Self::configuration().metamorph_after_sleep)).await;
         Ok(())
     }
 
     /// Adds a webhook for events of the current run. Off the platform, it is not created and
     /// `None` is returned.
-    pub async fn add_webhook(&self, options: WebhookOptions) -> ApifyClientResult<Option<Webhook>> {
-        if !self.is_at_home() {
+    pub async fn add_webhook(options: WebhookOptions) -> ApifyClientResult<Option<Webhook>> {
+        if !Self::is_at_home() {
             tracing::warn!(
                 "Actor::add_webhook() is only supported when running on the Apify platform. The webhook will not be \
                  invoked."
             );
             return Ok(None);
         }
-        let run_id = self.run_id()?;
+        let run_id = Self::run_id()?;
         let mut webhook = serde_json::to_value(&options)?;
         webhook["isAdHoc"] = serde_json::Value::Bool(true);
         webhook["condition"] = serde_json::json!({ "actorRunId": run_id });
-        Ok(Some(self.client().webhooks().create(&webhook).await?))
+        Ok(Some(Self::client().webhooks().create(&webhook).await?))
     }
 
     /// A state saved in the default key-value store on every `PersistState` event and restored
     /// when the run restarts (after a migration, for example). `key` defaults to
     /// `APIFY_GLOBAL_STATE`. Calls with the same key share the state.
     pub async fn use_state<T>(
-        &self,
         key: Option<&str>,
         default: impl Fn() -> T + Send + Sync + 'static,
     ) -> StorageResult<Arc<SerdeState<T>>>
     where
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
     {
-        self.services().auto_saved_value(key.unwrap_or(DEFAULT_STATE_KEY), default).await
+        Self::services().auto_saved_value(key.unwrap_or(DEFAULT_STATE_KEY), default).await
     }
 
-    fn run_id(&self) -> ApifyClientResult<String> {
-        self.configuration().actor_run_id.clone().ok_or_else(|| {
+    fn run_id() -> ApifyClientResult<String> {
+        Self::configuration().actor_run_id.clone().ok_or_else(|| {
             ApifyClientError::InvalidArgument("Environment variable ACTOR_RUN_ID is not set!".to_owned())
         })
     }
