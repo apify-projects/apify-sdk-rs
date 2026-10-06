@@ -24,8 +24,8 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
 - **The final status message is awaited.** The JS SDK gives the request that sets the terminal
   status message 1 ms before exiting. Here it gets up to 1 s (the status message timeout), since
   a process exit in Rust cuts off requests in flight.
-- **`Actor::current()` returns `Option`.** Before `Actor::init()` there is no Actor; the JS SDK
-  warns and continues with an uninitialized one.
+- **The Actor's functions panic before `Actor::init()`.** Calling them first is a bug in the code;
+  the JS SDK warns and continues with an uninitialized Actor.
 - **`abort` sets the status message on the aborted run.** The JS SDK sets it on the current run.
 - **`get_env` falls back to the `APIFY_*` variables.** The JS SDK reads both generations of
   variables into one object, and a missing `ACTOR_*` variable overwrites its `APIFY_*` predecessor

@@ -281,10 +281,9 @@ impl crate::Actor {
     /// Proxies for crawlers, like `Actor.createProxyConfiguration()` in JS (see
     /// [`ProxyConfiguration::new`]). The options are often the `proxy` field of the input.
     pub async fn create_proxy_configuration(
-        &self,
         options: ProxyConfigurationOptions,
     ) -> Result<Option<Arc<ProxyConfiguration>>, ProxyConfigurationError> {
-        ProxyConfiguration::new(self.configuration(), self.client(), options).await
+        ProxyConfiguration::new(Self::configuration(), Self::client(), options).await
     }
 }
 

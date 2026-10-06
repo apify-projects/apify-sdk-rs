@@ -125,24 +125,36 @@ struct Inner {
     websocket: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-/// An Actor run: a cheap handle to its configuration, storages, events and API client.
+/// The Actor run of this process, like the static `Actor` of the JS SDK: [`Actor::init`] once,
+/// then its functions from anywhere, and [`Actor::exit`] at the end.
 ///
-/// [`Actor::init`] creates it and installs its [`Services`] as the process-wide crawlee-rs
-/// services, so crawlers built afterwards store their data where the Actor does: in the
-/// platform storages on the platform, in `./storage` elsewhere. [`Actor::current`] returns it
-/// from anywhere, like the static `Actor` of the JS SDK.
-#[derive(Clone)]
-pub struct Actor {
-    inner: Arc<Inner>,
-}
+/// ```no_run
+/// # use apify::{Actor, ExitOptions, InitOptions};
+/// # async fn run() -> anyhow::Result<()> {
+/// Actor::init(InitOptions::default()).await?;
+/// let input: serde_json::Value = Actor::get_input().await?;
+/// Actor::push_data(&input).await?;
+/// Actor::exit(ExitOptions::default()).await;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`Actor::init`] installs the run's [`Services`] as the process-wide crawlee-rs services, so
+/// crawlers built afterwards store their data where the Actor does: in the platform storages on
+/// the platform, in `./storage` elsewhere.
+///
+/// # Panics
+///
+/// The functions that use the run panic when the Actor was not initialized: that is a bug in the
+/// code, not a condition to handle.
+pub enum Actor {}
 
-impl std::fmt::Debug for Actor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Actor").field("is_at_home", &self.inner.configuration.is_at_home).finish_non_exhaustive()
-    }
-}
+static STATE: OnceLock<Inner> = OnceLock::new();
 
-static CURRENT: OnceLock<Actor> = OnceLock::new();
+/// The state of the initialized Actor.
+fn state() -> &'static Inner {
+    STATE.get().expect("Actor::init() must be called before the other functions of Actor")
+}
 
 /// Initialization failed.
 #[derive(Debug, thiserror::Error)]
@@ -158,50 +170,6 @@ pub enum InitError {
     Charging(#[from] ChargingError),
 }
 
-/// Runs `user_function` as an Actor: [`Actor::init`], the function, then [`Actor::exit`]. When
-/// the function fails, the error is logged and the run exits with code 91.
-///
-/// ```no_run
-/// # async fn run() {
-/// apify::main(|actor| async move {
-///     let input: serde_json::Value = actor.get_input().await?;
-///     actor.push_data(&input).await?;
-///     Ok(())
-/// })
-/// .await;
-/// # }
-/// ```
-pub async fn main<F, Fut>(user_function: F)
-where
-    F: FnOnce(Actor) -> Fut,
-    Fut: Future<Output = anyhow::Result<()>>,
-{
-    main_with(InitOptions::default(), ExitOptions::default(), user_function).await;
-}
-
-/// [`main`] with options.
-pub async fn main_with<F, Fut>(init: InitOptions, exit: ExitOptions, user_function: F)
-where
-    F: FnOnce(Actor) -> Fut,
-    Fut: Future<Output = anyhow::Result<()>>,
-{
-    let actor = match Actor::init(init).await {
-        Ok(actor) => actor,
-        Err(err) => {
-            tracing::error!("Initializing the Actor failed: {err}");
-            flush_and_exit(exit_codes::ERROR_UNKNOWN);
-        }
-    };
-    match user_function(actor.clone()).await {
-        Ok(()) => actor.exit(exit).await,
-        Err(err) => {
-            tracing::error!("{err:?}");
-            // The JS SDK drops the other exit options here.
-            actor.exit(ExitOptions { exit_code: exit_codes::ERROR_USER_FUNCTION_THREW, ..exit }).await;
-        }
-    }
-}
-
 fn flush_and_exit(code: i32) -> ! {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -209,18 +177,55 @@ fn flush_and_exit(code: i32) -> ! {
 }
 
 impl Actor {
-    /// The Actor initialized in this process, if any.
-    pub fn current() -> Option<Actor> {
-        CURRENT.get().cloned()
+    /// Runs `user_function` as an Actor: [`Actor::init`], the function, then [`Actor::exit`].
+    /// When the function fails, the error is logged and the run exits with code 91.
+    ///
+    /// ```no_run
+    /// # use apify::Actor;
+    /// # async fn run() {
+    /// Actor::main(|| async {
+    ///     let input: serde_json::Value = Actor::get_input().await?;
+    ///     Actor::push_data(&input).await?;
+    ///     Ok(())
+    /// })
+    /// .await;
+    /// # }
+    /// ```
+    pub async fn main<F, Fut>(user_function: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+        Self::main_with(InitOptions::default(), ExitOptions::default(), user_function).await;
+    }
+
+    /// [`main`](Self::main) with options.
+    pub async fn main_with<F, Fut>(init: InitOptions, exit: ExitOptions, user_function: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+        if let Err(err) = Self::init(init).await {
+            tracing::error!("Initializing the Actor failed: {err}");
+            flush_and_exit(exit_codes::ERROR_UNKNOWN);
+        }
+        match user_function().await {
+            Ok(()) => Self::exit(exit).await,
+            Err(err) => {
+                tracing::error!("{err:?}");
+                // The JS SDK drops the other exit options here.
+                Self::exit(ExitOptions { exit_code: exit_codes::ERROR_USER_FUNCTION_THREW, ..exit }).await;
+            }
+        }
     }
 
     /// Initializes the Actor: installs the storages and events of the run as the process-wide
     /// crawlee-rs services, connects to the platform events, and purges the local default
-    /// storages. A second call returns the Actor of the first.
-    pub async fn init(options: InitOptions) -> Result<Actor, InitError> {
-        if let Some(actor) = Actor::current() {
+    /// storages. Later calls do nothing.
+    pub async fn init(options: InitOptions) -> Result<(), InitError> {
+        if STATE.get().is_some() {
             tracing::debug!("The Actor was already initialized");
-            return Ok(actor);
+            return Ok(());
         }
         if Services::is_global_set() {
             return Err(InitError::ServicesAlreadySet);
@@ -271,47 +276,44 @@ impl Actor {
             EventManager::local(&configuration.crawlee)
         };
         let services = Services::from_parts(configuration.crawlee.clone(), storage.clone(), events.clone());
+        // Only one `init` gets past this: the services can be set once.
         Services::set_global(services.clone()).map_err(|_| InitError::ServicesAlreadySet)?;
 
-        let actor = Actor {
-            inner: Arc::new(Inner {
-                configuration: configuration.clone(),
-                client,
-                storage,
-                smart,
-                charging,
-                services,
-                exiting: AtomicBool::new(false),
-                rebooting: AtomicBool::new(false),
-                handlers: Mutex::default(),
-                websocket: Mutex::default(),
-            }),
+        let inner = Inner {
+            configuration: configuration.clone(),
+            client,
+            storage,
+            smart,
+            charging,
+            services,
+            exiting: AtomicBool::new(false),
+            rebooting: AtomicBool::new(false),
+            handlers: Mutex::default(),
+            websocket: Mutex::default(),
         };
+        if STATE.set(inner).is_err() {
+            return Err(InitError::ServicesAlreadySet);
+        }
+        let state = state();
 
         events.init().await;
         if options.graceful_shutdown {
-            actor.register_graceful_shutdown(options.graceful_shutdown_delay);
+            Self::register_graceful_shutdown(options.graceful_shutdown_delay);
         }
         // Crawlers report their status as `StatusMessage` events.
-        let forwarder = {
-            let actor = actor.clone();
-            events.on(EventKind::StatusMessage, move |event| {
-                let actor = actor.clone();
-                async move {
-                    if let Event::StatusMessage(status) = event {
-                        actor.update_run_status_message(&status.message, status.is_terminal).await;
-                    }
-                }
-            })
-        };
-        actor.inner.handlers.lock().status_forwarder = Some(forwarder);
+        let forwarder = events.on(EventKind::StatusMessage, |event| async move {
+            if let Event::StatusMessage(status) = event {
+                Self::update_run_status_message(&status.message, status.is_terminal).await;
+            }
+        });
+        state.handlers.lock().status_forwarder = Some(forwarder);
 
         // Connected once the listeners are in place, so that no early event is missed.
         if configuration.is_at_home {
             match &configuration.actor_events_ws_url {
                 Some(url) => {
                     let memory = configuration.crawlee.memory_mbytes.map(|mb| mb * 1024 * 1024);
-                    *actor.inner.websocket.lock() = Some(crate::events::connect(url, events.clone(), memory).await);
+                    *state.websocket.lock() = Some(crate::events::connect(url, events.clone(), memory).await);
                 }
                 None => tracing::debug!(
                     "Environment variable ACTOR_EVENTS_WEBSOCKET_URL is not set, no events from Apify platform will be emitted."
@@ -319,88 +321,78 @@ impl Actor {
             }
         }
 
-        actor.inner.services.purge_on_start().await?;
-        actor.inner.charging.init(actor.inner.storage.as_ref()).await?;
-        if actor.inner.charging.is_pay_per_event() && actor.inner.smart.is_none() {
+        state.services.purge_on_start().await?;
+        state.charging.init(state.storage.as_ref()).await?;
+        if state.charging.is_pay_per_event() && state.smart.is_none() {
             tracing::warn!(
                 "Items pushed to the default dataset will not be charged for, because this run does not use Apify \
                  storage - the platform only counts items it stores itself."
             );
         }
-        // Only the first `init` of the process gets here.
-        let _ = CURRENT.set(actor.clone());
-        Ok(actor)
+        Ok(())
     }
 
     /// On `aborting`, exit; on `migrating`, reboot to move sooner. Both run outside the listener,
     /// which `exit` and `reboot` wait for.
-    fn register_graceful_shutdown(&self, delay: Duration) {
-        let events = self.events().clone();
-        let aborting = {
-            let actor = self.clone();
-            events.on(EventKind::Aborting, move |_| {
-                let actor = actor.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    actor.exit(ExitOptions::default()).await;
-                });
-                async {}
-            })
-        };
-        let migrating = {
-            let actor = self.clone();
-            events.on(EventKind::Migrating, move |_| {
-                let actor = actor.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    if let Err(err) = actor.reboot().await {
-                        tracing::error!("Failed to reboot on migration: {err}");
-                    }
-                });
-                async {}
-            })
-        };
-        self.inner.handlers.lock().graceful = vec![aborting, migrating];
+    fn register_graceful_shutdown(delay: Duration) {
+        let events = Self::events();
+        let aborting = events.on(EventKind::Aborting, move |_| {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                Self::exit(ExitOptions::default()).await;
+            });
+            async {}
+        });
+        let migrating = events.on(EventKind::Migrating, move |_| {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Err(err) = Self::reboot().await {
+                    tracing::error!("Failed to reboot on migration: {err}");
+                }
+            });
+            async {}
+        });
+        state().handlers.lock().graceful = vec![aborting, migrating];
     }
 
-    pub fn configuration(&self) -> &Arc<Configuration> {
-        &self.inner.configuration
+    pub fn configuration() -> &'static Arc<Configuration> {
+        &state().configuration
     }
 
     /// The API client of the run, authenticated with `APIFY_TOKEN`.
-    pub fn client(&self) -> &ApifyClient {
-        &self.inner.client
+    pub fn client() -> &'static ApifyClient {
+        &state().client
     }
 
     /// A client authenticated with another token.
-    pub fn new_client(&self, token: &str) -> ApifyClient {
-        new_client(&self.inner.configuration, Some(token), RateLimitCounter::default())
+    pub fn new_client(token: &str) -> ApifyClient {
+        new_client(&state().configuration, Some(token), RateLimitCounter::default())
     }
 
     /// The services of the run, which crawlers use by default.
-    pub fn services(&self) -> &Services {
-        &self.inner.services
+    pub fn services() -> &'static Services {
+        &state().services
     }
 
-    pub fn events(&self) -> &EventManager {
-        &self.inner.services.events
+    pub fn events() -> &'static EventManager {
+        &state().services.events
     }
 
-    pub fn is_at_home(&self) -> bool {
-        self.inner.configuration.is_at_home
+    pub fn is_at_home() -> bool {
+        state().configuration.is_at_home
     }
 
     /// Ends the run: stops the events (after a final `PersistState`), waits for their listeners,
     /// tears the storages down, sets the terminal status message and exits the process with
     /// [`ExitOptions::exit_code`]. If this takes longer than [`ExitOptions::timeout`], the process
     /// exits anyway. Returns only with [`ExitOptions::exit`] set to `false`, or when already exiting.
-    pub async fn exit(&self, options: ExitOptions) {
-        if self.inner.exiting.swap(true, Ordering::AcqRel) {
+    pub async fn exit(options: ExitOptions) {
+        if state().exiting.swap(true, Ordering::AcqRel) {
             tracing::debug!("Actor::exit() called while already exiting, skipping");
             return;
         }
-        let events = self.events().clone();
-        for id in std::mem::take(&mut self.inner.handlers.lock().graceful) {
+        let events = Self::events().clone();
+        for id in std::mem::take(&mut state().handlers.lock().graceful) {
             events.off(id);
         }
 
@@ -421,15 +413,15 @@ impl Actor {
         let teardown = async {
             events.wait_for_all_listeners_to_complete().await;
             // Final status messages are forwarded by now; later ones must not overwrite the terminal one.
-            if let Some(id) = self.inner.handlers.lock().status_forwarder.take() {
+            if let Some(id) = state().handlers.lock().status_forwarder.take() {
                 events.off(id);
             }
-            if let Err(err) = self.inner.storage.teardown().await {
+            if let Err(err) = state().storage.teardown().await {
                 tracing::error!("Tearing down the storage failed: {err}");
             }
             if let Some(message) = &options.status_message {
                 let level = if options.exit_code > 0 { StatusLevel::Error } else { StatusLevel::Info };
-                self.set_status_message(message, StatusMessageOptions { is_terminal: true, level }).await;
+                Self::set_status_message(message, StatusMessageOptions { is_terminal: true, level }).await;
             }
         };
         if tokio::time::timeout(options.timeout, teardown).await.is_err() {
@@ -438,36 +430,36 @@ impl Actor {
                 options.timeout.as_secs()
             );
         }
-        if let Some(websocket) = self.inner.websocket.lock().take() {
+        if let Some(websocket) = state().websocket.lock().take() {
             websocket.abort();
         }
 
-        self.inner.exiting.store(false, Ordering::Release);
+        state().exiting.store(false, Ordering::Release);
         if options.exit {
             flush_and_exit(options.exit_code);
         }
     }
 
     /// [`exit`](Self::exit) with exit code 1.
-    pub async fn fail(&self, options: ExitOptions) {
-        self.exit(ExitOptions { exit_code: 1, ..options }).await;
+    pub async fn fail(options: ExitOptions) {
+        Self::exit(ExitOptions { exit_code: 1, ..options }).await;
     }
 
     /// Sets the status message of the run, and logs it.
-    pub async fn set_status_message(&self, message: &str, options: StatusMessageOptions) {
+    pub async fn set_status_message(message: &str, options: StatusMessageOptions) {
         match options.level {
             StatusLevel::Warning => tracing::warn!("[Status message]: {message}"),
             StatusLevel::Error => tracing::error!("[Status message]: {message}"),
             _ => tracing::info!("[Status message]: {message}"),
         }
-        self.update_run_status_message(message, options.is_terminal).await;
+        Self::update_run_status_message(message, options.is_terminal).await;
     }
 
     /// Best effort: a failure or a slow API is only logged.
-    async fn update_run_status_message(&self, message: &str, is_terminal: bool) {
-        let Some(run_id) = &self.inner.configuration.actor_run_id else { return };
+    async fn update_run_status_message(message: &str, is_terminal: bool) {
+        let Some(run_id) = &state().configuration.actor_run_id else { return };
         let body = serde_json::json!({ "statusMessage": message, "isStatusMessageTerminal": is_terminal });
-        let run = self.inner.client.run(run_id.clone());
+        let run = state().client.run(run_id.clone());
         match tokio::time::timeout(STATUS_MESSAGE_TIMEOUT, run.update(&body)).await {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => tracing::warn!("Setting the status message failed: {err}"),
@@ -477,18 +469,18 @@ impl Actor {
 
     /// Reboots the run on the platform (a new container, same run), after its state was saved.
     /// Does nothing off the platform.
-    pub async fn reboot(&self) -> Result<(), apify_client::ApifyClientError> {
-        let configuration = &self.inner.configuration;
+    pub async fn reboot() -> Result<(), apify_client::ApifyClientError> {
+        let configuration = &state().configuration;
         if !configuration.is_at_home {
             tracing::warn!("Actor::reboot() is only supported when running on the Apify platform.");
             return Ok(());
         }
-        if self.inner.rebooting.swap(true, Ordering::AcqRel) {
+        if state().rebooting.swap(true, Ordering::AcqRel) {
             tracing::debug!("Actor is already rebooting, skipping the additional reboot call.");
             return Ok(());
         }
         // The container is killed: save the state and pause the crawlers first.
-        let events = self.events();
+        let events = Self::events();
         events.emit(Event::PersistState { is_migrating: false });
         events.emit(Event::Migrating);
         events.wait_for_all_listeners_to_complete().await;
@@ -497,88 +489,79 @@ impl Actor {
             .actor_run_id
             .clone()
             .ok_or_else(|| apify_client::ApifyClientError::InvalidArgument("ACTOR_RUN_ID is not set".to_owned()))?;
-        self.inner.client.run(run_id).reboot().await?;
+        state().client.run(run_id).reboot().await?;
         tokio::time::sleep(configuration.metamorph_after_sleep).await;
         Ok(())
     }
 
-    fn storage_for(&self, options: OpenOptions) -> crawlee::core::StorageResult<&dyn StorageBackend> {
-        match &self.inner.smart {
+    fn storage_for(options: OpenOptions) -> crawlee::core::StorageResult<&'static dyn StorageBackend> {
+        match &state().smart {
             Some(smart) => smart.suitable(options.force_cloud),
-            None => Ok(self.inner.storage.as_ref()),
+            None => Ok(state().storage.as_ref()),
         }
     }
 
-    pub async fn open_dataset(
-        &self,
-        id: &StorageIdentifier,
-        options: OpenOptions,
-    ) -> crawlee::core::StorageResult<Dataset> {
-        Dataset::open(self.storage_for(options)?, id).await
+    pub async fn open_dataset(id: &StorageIdentifier, options: OpenOptions) -> crawlee::core::StorageResult<Dataset> {
+        Dataset::open(Self::storage_for(options)?, id).await
     }
 
     pub async fn open_key_value_store(
-        &self,
         id: &StorageIdentifier,
         options: OpenOptions,
     ) -> crawlee::core::StorageResult<KeyValueStore> {
-        KeyValueStore::open(self.storage_for(options)?, id).await
+        KeyValueStore::open(Self::storage_for(options)?, id).await
     }
 
     pub async fn open_request_queue(
-        &self,
         id: &StorageIdentifier,
         options: OpenOptions,
     ) -> crawlee::core::StorageResult<RequestQueue> {
-        RequestQueue::open(self.storage_for(options)?, id).await
+        RequestQueue::open(Self::storage_for(options)?, id).await
     }
 
     /// The pay-per-event charges of the run.
-    pub fn charging_manager(&self) -> &Arc<ChargingManager> {
-        &self.inner.charging
+    pub fn charging_manager() -> &'static Arc<ChargingManager> {
+        &state().charging
     }
 
     /// Charges for `count` events of `event_name` (see [`ChargingManager::charge`]).
-    pub async fn charge(&self, options: ChargeOptions) -> Result<ChargeResult, ChargingError> {
-        self.inner.charging.charge(options).await
+    pub async fn charge(options: ChargeOptions) -> Result<ChargeResult, ChargingError> {
+        state().charging.charge(options).await
     }
 
     /// Pushes one item (an object) or several (an array) to the default dataset. Under
     /// pay-per-event pricing, only as many items are stored as the budget allows, each charged as
     /// an `apify-default-dataset-item` event.
-    pub async fn push_data<T: serde::Serialize + ?Sized>(&self, data: &T) -> Result<ChargeResult, ChargingError> {
-        self.push_items_charging(data, &[]).await
+    pub async fn push_data<T: serde::Serialize + ?Sized>(data: &T) -> Result<ChargeResult, ChargingError> {
+        Self::push_items_charging(data, &[]).await
     }
 
     /// Pushes items to the default dataset and charges `event_name` for each, as many as the
     /// budget allows (`Actor.pushData(items, eventName)` in JS).
     pub async fn push_data_and_charge<T: serde::Serialize + ?Sized>(
-        &self,
         data: &T,
         event_name: &str,
     ) -> Result<ChargeResult, ChargingError> {
-        self.push_data_and_charge_events(data, &[event_name]).await
+        Self::push_data_and_charge_events(data, &[event_name]).await
     }
 
     /// Pushes items to the default dataset and charges each of `events` for each item, as many
     /// items as the budget allows for all of them. `event_charge_limit_reached` is set when the
     /// budget allows no more of one of the events.
     pub async fn push_data_and_charge_events<T: serde::Serialize + ?Sized>(
-        &self,
         data: &T,
         events: &[&str],
     ) -> Result<ChargeResult, ChargingError> {
         if let Some(event) = events.iter().find(|event| event.starts_with("apify-")) {
             return Err(ChargingError::SyntheticEvent((*event).to_owned()));
         }
-        self.push_items_charging(data, events).await
+        Self::push_items_charging(data, events).await
     }
 
     /// Stores as many items as the budget allows for `events` (plus the default dataset item
     /// event), reserving their charges first and sending them after, so that concurrent pushes
     /// neither wait for each other nor spend more than the budget together.
     async fn push_items_charging<T: serde::Serialize + ?Sized>(
-        &self,
         data: &T,
         events: &[&str],
     ) -> Result<ChargeResult, ChargingError> {
@@ -586,8 +569,8 @@ impl Actor {
             Value::Array(items) => items,
             item => vec![item],
         };
-        let dataset = self.inner.services.open_dataset(&StorageIdentifier::Default).await?;
-        let charging = &self.inner.charging;
+        let dataset = state().services.open_dataset(&StorageIdentifier::Default).await?;
+        let charging = &state().charging;
         if !charging.is_pay_per_event() {
             dataset.push_data(&items).await?;
             // Warns that the Actor is not pay-per-event.
@@ -602,7 +585,7 @@ impl Actor {
             }));
         }
         // Storing an item also charges the per-item event when the dataset is the Actor's own.
-        let is_default_dataset = self.inner.smart.is_some();
+        let is_default_dataset = state().smart.is_some();
         let limit = charging.reserve_items(items.len(), events, is_default_dataset);
         if limit == 0 {
             return Ok(ChargeResult {
@@ -631,27 +614,22 @@ impl Actor {
     }
 
     /// A value of the default key-value store.
-    pub async fn get_value<T: DeserializeOwned>(&self, key: &str) -> crawlee::core::StorageResult<Option<T>> {
-        self.inner.services.open_key_value_store(&StorageIdentifier::Default).await?.get_value(key).await
+    pub async fn get_value<T: DeserializeOwned>(key: &str) -> crawlee::core::StorageResult<Option<T>> {
+        state().services.open_key_value_store(&StorageIdentifier::Default).await?.get_value(key).await
     }
 
     /// Stores a value as JSON in the default key-value store.
-    pub async fn set_value<T: serde::Serialize + ?Sized>(
-        &self,
-        key: &str,
-        value: &T,
-    ) -> crawlee::core::StorageResult<()> {
-        self.inner.services.open_key_value_store(&StorageIdentifier::Default).await?.set_value(key, value).await
+    pub async fn set_value<T: serde::Serialize + ?Sized>(key: &str, value: &T) -> crawlee::core::StorageResult<()> {
+        state().services.open_key_value_store(&StorageIdentifier::Default).await?.set_value(key, value).await
     }
 
     /// The input of the run, as it was stored. Locally, an `INPUT` or `INPUT.json` file in the
     /// working directory is used when the default key-value store has no input.
-    pub async fn get_input_raw(&self) -> Result<Input, ActorInputError> {
-        let configuration = &self.inner.configuration;
+    pub async fn get_input_raw() -> Result<Input, ActorInputError> {
+        let configuration = &state().configuration;
         let key = &configuration.input_key;
         let source = format!("the \"{key}\" record of the default key-value store");
-        let store = self
-            .inner
+        let store = state()
             .services
             .open_key_value_store(&StorageIdentifier::Default)
             .await
@@ -675,13 +653,13 @@ impl Actor {
                 format!("Input does not exist. Expected {}.", locations.join(" or ")),
             ));
         };
-        let input = self.decrypt_secrets(input)?;
-        Ok(self.with_schema_defaults(input))
+        let input = Self::decrypt_secrets(input)?;
+        Ok(Self::with_schema_defaults(input))
     }
 
     /// Decrypts the secret fields, when the platform passed the key.
-    fn decrypt_secrets(&self, input: Input) -> Result<Input, ActorInputError> {
-        let configuration = &self.inner.configuration;
+    fn decrypt_secrets(input: Input) -> Result<Input, ActorInputError> {
+        let configuration = &state().configuration;
         let (Some(key_file), Some(passphrase)) =
             (&configuration.input_secrets_private_key_file, &configuration.input_secrets_private_key_passphrase)
         else {
@@ -705,8 +683,8 @@ impl Actor {
 
     /// The input of the run as `T`, from JSON (see [`get_input_raw`](Self::get_input_raw)).
     /// Locally, missing top-level fields get their defaults from the Actor's input schema.
-    pub async fn get_input<T: DeserializeOwned>(&self) -> Result<T, ActorInputError> {
-        let input = self.get_input_raw().await?;
+    pub async fn get_input<T: DeserializeOwned>() -> Result<T, ActorInputError> {
+        let input = Self::get_input_raw().await?;
         let json = input
             .into_json()
             .ok_or_else(|| ActorInputError::new(ActorInputErrorCode::ParseFailed, "The input is binary, not JSON."))?;
@@ -720,9 +698,9 @@ impl Actor {
     }
 
     /// The platform applies the defaults itself.
-    fn with_schema_defaults(&self, input: Input) -> Input {
+    fn with_schema_defaults(input: Input) -> Input {
         let Input::Json(Value::Object(object)) = input else { return input };
-        if self.inner.configuration.is_at_home || object.is_empty() {
+        if state().configuration.is_at_home || object.is_empty() {
             return Input::Json(Value::Object(object));
         }
         match crate::input::read_input_schema(&working_directory()) {

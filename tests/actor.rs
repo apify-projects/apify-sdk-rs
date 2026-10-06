@@ -7,6 +7,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+use apify::Actor;
 use serde_json::{Value, json};
 
 use common::{DEFAULT_DATASET, DEFAULT_QUEUE, DEFAULT_STORE, FakeApi, TOKEN};
@@ -84,6 +85,30 @@ async fn a_failing_user_function_exits_with_91() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("boom"));
     // The exit options of `main_with` are kept (the JS SDK drops them).
     assert_eq!(terminal_messages(&api), ["Done"]);
+}
+
+/// `Actor::init` and `exit` without `Actor::main`, and the functions of the Actor in between.
+#[tokio::test]
+async fn an_actor_initialized_and_exited_explicitly() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "INPUT", br#"{"greeting":"hi"}"#, "application/json; charset=utf-8");
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = run_child("init-exit", &platform_env(&api, None), dir.path()).await;
+    assert_exit(&output, 0);
+    assert_eq!(api.dataset_items(DEFAULT_DATASET), [json!({ "echo": { "greeting": "hi" } })]);
+    assert_eq!(terminal_messages(&api), ["Echoed"]);
+}
+
+#[tokio::test]
+async fn the_actor_panics_before_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("before-init", &[], dir.path()).await;
+    assert_exit(&output, 101);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Actor::init() must be called before the other functions of Actor")
+    );
 }
 
 #[tokio::test]
@@ -304,20 +329,20 @@ fn child() {
         match scenario.as_str() {
             "echo" => {
                 let exit = apify::ExitOptions::message("Echoed");
-                apify::main_with(apify::InitOptions::default(), exit, |actor| async move {
-                    let input: Value = actor.get_input().await?;
-                    actor.push_data(&json!({ "echo": input })).await?;
+                Actor::main_with(apify::InitOptions::default(), exit, || async move {
+                    let input: Value = Actor::get_input().await?;
+                    Actor::push_data(&json!({ "echo": input })).await?;
                     Ok(())
                 })
                 .await
             }
             "fail" => {
                 let exit = apify::ExitOptions::message("Done");
-                apify::main_with(apify::InitOptions::default(), exit, |_| async { anyhow::bail!("boom") }).await
+                Actor::main_with(apify::InitOptions::default(), exit, || async { anyhow::bail!("boom") }).await
             }
             "wait" | "migrate" => {
-                apify::main(|actor| async move {
-                    let state = actor.services().auto_saved_value("STATE", || json!({ "count": 0 })).await?;
+                Actor::main(|| async move {
+                    let state = Actor::services().auto_saved_value("STATE", || json!({ "count": 0 })).await?;
                     state.lock()["count"] = json!(1);
                     let wait = if scenario == "wait" { 60 } else { 2 };
                     tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -326,55 +351,54 @@ fn child() {
                 .await
             }
             "platform" => {
-                apify::main(|actor| async move {
-                    let state = actor.use_state(None, || json!({ "calls": 0 })).await?;
+                Actor::main(|| async move {
+                    let state = Actor::use_state(None, || json!({ "calls": 0 })).await?;
                     let inherit =
                         apify::CallOptions { timeout: Some(apify::RunTimeout::Inherit), ..Default::default() };
-                    let run = actor.call("apify/hello-world", Some(&json!({ "a": 1 })), inherit).await?;
+                    let run = Actor::call("apify/hello-world", Some(&json!({ "a": 1 })), inherit).await?;
                     assert_eq!(run.status.as_deref(), Some("SUCCEEDED"));
                     let mut options = apify::CallOptions::default();
                     options.start.memory_mbytes = Some(512);
-                    actor.call_task("user/task", None::<&Value>, options).await?;
+                    Actor::call_task("user/task", None::<&Value>, options).await?;
                     let abort = apify::AbortOptions {
                         status_message: Some("Stopped by the parent".to_owned()),
                         gracefully: Some(true),
                         ..Default::default()
                     };
-                    actor.abort("other-run", abort).await?;
+                    Actor::abort("other-run", abort).await?;
                     let webhook = apify::WebhookOptions {
                         event_types: vec!["ACTOR.RUN.SUCCEEDED".to_owned()],
                         request_url: "https://example.com/hook".to_owned(),
                         ..Default::default()
                     };
-                    assert!(actor.add_webhook(webhook).await?.is_some());
-                    actor.metamorph("apify/other", None::<&Value>, Default::default()).await?;
+                    assert!(Actor::add_webhook(webhook).await?.is_some());
+                    Actor::metamorph("apify/other", None::<&Value>, Default::default()).await?;
                     state.lock()["calls"] = json!(5);
                     Ok(())
                 })
                 .await
             }
             "ppe" => {
-                apify::main(|actor| async move {
-                    assert!(actor.charging_manager().is_pay_per_event());
+                Actor::main(|| async move {
+                    assert!(Actor::charging_manager().is_pay_per_event());
                     let items: Vec<Value> = (0..20).map(|n| json!({ "n": n })).collect();
-                    let result = actor.push_data(&items).await?;
+                    let result = Actor::push_data(&items).await?;
                     assert_eq!(result.charged_count, 10);
                     assert!(result.event_charge_limit_reached);
-                    let result = actor.charge(apify::charging::ChargeOptions::new("page", 1)).await?;
+                    let result = Actor::charge(apify::charging::ChargeOptions::new("page", 1)).await?;
                     assert_eq!(result.charged_count, 1, "one over the budget, so that the platform stops the run");
-                    let result = actor.push_data_and_charge(&items[..3], "page").await?;
+                    let result = Actor::push_data_and_charge(&items[..3], "page").await?;
                     assert_eq!(result.charged_count, 0);
-                    assert!(actor.push_data_and_charge(&items[0], "apify-default-dataset-item").await.is_err());
+                    assert!(Actor::push_data_and_charge(&items[0], "apify-default-dataset-item").await.is_err());
                     Ok(())
                 })
                 .await
             }
             "ppe-concurrent" => {
-                apify::main(|actor| async move {
+                Actor::main(|| async move {
                     let started = std::time::Instant::now();
                     let pushes = (0..30).map(|n| {
-                        let actor = actor.clone();
-                        tokio::spawn(async move { actor.push_data_and_charge(&json!({ "n": n }), "page").await })
+                        tokio::spawn(async move { Actor::push_data_and_charge(&json!({ "n": n }), "page").await })
                     });
                     let mut stored = 0;
                     for push in pushes.collect::<Vec<_>>() {
@@ -389,16 +413,29 @@ fn child() {
                 .await
             }
             "ppe-local" => {
-                apify::main(|actor| async move {
+                Actor::main(|| async move {
                     let items: Vec<Value> = (0..5).map(|n| json!({ "n": n })).collect();
-                    assert_eq!(actor.push_data(&items).await?.charged_count, 3);
+                    assert_eq!(Actor::push_data(&items).await?.charged_count, 3);
                     Ok(())
                 })
                 .await
             }
+            "init-exit" => {
+                async fn echo() -> anyhow::Result<()> {
+                    let input: Value = Actor::get_input().await?;
+                    Actor::push_data(&json!({ "echo": input })).await?;
+                    Ok(())
+                }
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                echo().await.unwrap();
+                Actor::exit(apify::ExitOptions::message("Echoed")).await;
+            }
+            "before-init" => {
+                Actor::is_at_home();
+            }
             "late-init" => {
                 crawlee::Services::global();
-                let result = apify::Actor::init(apify::InitOptions::default()).await;
+                let result = Actor::init(apify::InitOptions::default()).await;
                 assert!(matches!(result, Err(apify::InitError::ServicesAlreadySet)));
                 std::process::exit(0);
             }

@@ -24,7 +24,7 @@ apify (crate)
 
 **How it hooks into crawlee-rs:**
 - `Actor::init()` builds `Services::from_parts(config, smart_backend, platform_events)` and installs it with `Services::set_global`. Crawlers built afterwards use it with no extra code.
-- An existing crawlee-rs crawler becomes an Actor by wrapping it in `apify::main`.
+- An existing crawlee-rs crawler becomes an Actor by wrapping it in `Actor::main`, or between `Actor::init` and `Actor::exit`.
 
 ## Straightforward
 
@@ -73,7 +73,7 @@ These are direct mappings: the client already has the endpoint, or crawlee-rs al
 4. **Platform storage hooks.** Possibly a `StorageBackend::stats()` extension. crawlee-rs's `purge_on_start` semantics already fit: on the platform the cloud backend's purge is a no-op, as in JS.
 
 **Deliberate API differences from JS, to agree on:**
-- **Entry point.** JS has a static singleton (`Actor.pushData`). I'd make `Actor` a cheap cloneable handle returned by `Actor::init()` and passed into the closure in `apify::main(|actor| async move { … })`, plus `Actor::current()` for code that can't receive it. A `#[apify::main]` macro could come later.
+- **Entry point.** JS has a static singleton (`Actor.pushData`). I'd make `Actor` a cheap cloneable handle returned by `Actor::init()` and passed into the closure in `apify::main(|actor| async move { … })`, plus `Actor::current()` for code that can't receive it. Since then, `Actor` is static as in JS: `Actor::init()` once, then `Actor::get_input()`, `Actor::push_data()`... from anywhere, panicking when not initialized. A `#[apify::main]` macro could come later.
 - **JS bugs to fix, not copy:**
   - "At home" is read two ways (the env var in some places, the configuration in others). Make it one.
   - `abort({statusMessage})` sets the message on the current run instead of the aborted one.
@@ -82,7 +82,7 @@ These are direct mappings: the client already has the endpoint, or crawlee-rs al
 
   Each fix would be listed in an allowed-differences file.
 - **No crawlee version check**, since Cargo handles that.
-- **`push_data` with an event name.** In JS it returns a `ChargeResult` and refuses to run inside a transaction. In Rust, `ctx.push_data` in crawler handlers stays transactional and charges only the synthetic dataset-item event at commit, as in JS. Charging for a custom event goes through `actor.push_data(item, event)`, outside the transaction, which also matches JS.
+- **`push_data` with an event name.** In JS it returns a `ChargeResult` and refuses to run inside a transaction. In Rust, `ctx.push_data` in crawler handlers stays transactional and charges only the synthetic dataset-item event at commit, as in JS. Charging for a custom event goes through `Actor::push_data_and_charge(item, event)`, outside the transaction, which also matches JS.
 
 ## Checking that it behaves like the JS SDK
 
@@ -107,8 +107,8 @@ M1 is the smallest slice that meets "run real Actors with crawlee-rs". Everythin
 Agreed before implementation started:
 
 1. **Crate name:** `apify`, a single crate. Not published to crates.io yet.
-2. **API style:** a cloneable `Actor` handle returned by `Actor::init()` and passed to the closure of
-   `apify::main`, plus `Actor::current()` as the counterpart of the JS static singleton.
+2. **API style:** static, as in JS: `Actor::init()` once, then `Actor::get_input()`,
+   `Actor::push_data()`... from anywhere, and `Actor::exit()` (or `Actor::main` for all three).
 3. **JS quirks:** the clear bugs listed above are fixed, not copied, and each one is listed in
    `docs/allowed-differences.md`.
 4. **Platform access:** live and e2e tests are gated on `APIFY_TOKEN`, which will be provided later.
